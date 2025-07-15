@@ -3,6 +3,8 @@ import { SecretManagerServiceClient } from '@google-cloud/secret-manager';
 export interface Credentials {
   username: string;
   password: string;
+  token?: string;
+  expiresAt?: number;
 }
 
 export class SecretsManagerService {
@@ -16,10 +18,19 @@ export class SecretsManagerService {
 
   async getCredentials(key: string): Promise<Credentials> {
     try {
-      const secretName = `projects/${this.projectId}/secrets/${key}/versions/latest`;
+      const secretName = `projects/${this.projectId}/secrets/${key}`;
       
+      const [versions] = await this.client.listSecretVersions({
+        parent: secretName,
+      });
+
+      const activeVersion = versions.find(v => v.state === 'ENABLED');
+      if (!activeVersion?.name) {
+        throw new Error(`No active version found for secret: ${key}`);
+      }
+
       const [version] = await this.client.accessSecretVersion({
-        name: secretName,
+        name: activeVersion.name,
       });
 
       if (!version.payload?.data) {
@@ -35,7 +46,9 @@ export class SecretsManagerService {
 
       return {
         username: credentials.username,
-        password: credentials.password
+        password: credentials.password,
+        token: credentials.token,
+        expiresAt: credentials.expiresAt
       };
     } catch (error) {
       throw new Error(`Failed to retrieve credentials for key '${key}': ${error}`);
@@ -55,6 +68,43 @@ export class SecretsManagerService {
     } catch (error) {
       console.error('Failed to list secrets:', error);
       return [];
+    }
+  }
+
+  /**
+   * Updates (adds a new version to) the secret with the given key, storing the provided credentials object as JSON.
+   * If the secret does not exist, it will be created.
+   */
+  async updateCredentials(key: string, credentials: Credentials): Promise<void> {
+    const secretId = key;
+    const parent = `projects/${this.projectId}`;
+    const secretName = `${parent}/secrets/${secretId}`;
+    const payload = JSON.stringify(credentials);
+    try {
+      // Try to add a new version to the secret
+      await this.client.addSecretVersion({
+        parent: secretName,
+        payload: { data: Buffer.from(payload, 'utf8') },
+      });
+    } catch (err: any) {
+      // If the secret does not exist, create it and then add the version
+      if (err.code === 5 || (err.message && err.message.includes('not found'))) {
+        // Create the secret
+        await this.client.createSecret({
+          parent,
+          secretId,
+          secret: {
+            replication: { automatic: {} },
+          },
+        });
+        // Add the version
+        await this.client.addSecretVersion({
+          parent: secretName,
+          payload: { data: Buffer.from(payload, 'utf8') },
+        });
+      } else {
+        throw new Error(`Failed to update credentials for key '${key}': ${err}`);
+      }
     }
   }
 } 

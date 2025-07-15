@@ -1,4 +1,4 @@
-import { BaseAdapter, LoginCredentials, AdapterResponse } from "./base-adapter";
+import { BaseAdapter, AdapterResponse } from "./base-adapter";
 
 export class SportlotsAdapter extends BaseAdapter {
   constructor(page: any) {
@@ -9,14 +9,15 @@ export class SportlotsAdapter extends BaseAdapter {
     return "https://www.sportlots.com";
   }
 
-  async login(_credentials: LoginCredentials): Promise<AdapterResponse> {
+  async login(key: string): Promise<AdapterResponse> {
     try {
+      const { page } = await this.loginWithBrowser(key);
       // For now, just navigate to the home page
       await this.navigateToHome();
       
       return {
         success: true,
-        message: `Successfully navigated to ${this.siteName} home page`
+        message: `Successfully navigated to ${this.siteName} home ${page?.title}`
       };
     } catch (error) {
       return {
