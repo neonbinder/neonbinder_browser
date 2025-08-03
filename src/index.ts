@@ -2,6 +2,7 @@ import express, { Request, Response } from "express";
 import { SiteType, SUPPORTED_SITES } from "./adapters";
 import { SecretsManagerService } from "./services/secrets-manager";
 import { BSCAdapter } from "./adapters/bsc-adapter";
+import { SportlotsAdapter } from "./adapters/sportlots-adapter";
 
 interface LoginRequest {
   site: SiteType;
@@ -52,6 +53,8 @@ app.post("/login", async (req: Request<{}, {}, LoginRequest>, res: Response<Logi
     let adapter;
     if (site === 'bsc') {
       adapter = new BSCAdapter();
+    } else if (site === 'sportlots') {
+      adapter = new SportlotsAdapter(undefined);
     } else {
       // Add other adapters as needed
       res.status(400).json({ error: `Unsupported site: ${site}` });
@@ -65,6 +68,39 @@ app.post("/login", async (req: Request<{}, {}, LoginRequest>, res: Response<Logi
     }
   } catch (err) {
     console.error("Login failed:", err);
+    res.status(500).json({ error: "Login failed" });
+  }
+});
+
+// Site-specific login endpoints
+app.post("/login/bsc", async (req: Request<{}, {}, { key: string }>, res: Response<LoginResponse | ErrorResponse>) => {
+  const { key } = req.body;
+  try {
+    const adapter = new BSCAdapter();
+    const result = await adapter.login(key);
+    if (result.success) {
+      res.json({ success: true, message: result.message });
+    } else {
+      res.status(500).json({ error: result.error || "Login failed" });
+    }
+  } catch (err) {
+    console.error("BSC login failed:", err);
+    res.status(500).json({ error: "Login failed" });
+  }
+});
+
+app.post("/login/sportlots", async (req: Request<{}, {}, { key: string }>, res: Response<LoginResponse | ErrorResponse>) => {
+  const { key } = req.body;
+  try {
+    const adapter = new SportlotsAdapter(undefined);
+    const result = await adapter.login(key);
+    if (result.success) {
+      res.json({ success: true, message: result.message });
+    } else {
+      res.status(500).json({ error: result.error || "Login failed" });
+    }
+  } catch (err) {
+    console.error("Sportlots login failed:", err);
     res.status(500).json({ error: "Login failed" });
   }
 });
