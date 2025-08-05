@@ -182,4 +182,112 @@ export class BSCAdapter extends BaseAdapter {
       error: `Unknown error occurred during login for ${this.siteName}`,
     };
   }
+
+  async getAvailableSetParameters(partialParams: {
+    sport?: string;
+    year?: number;
+    manufacturer?: string;
+    setName?: string;
+    variantType?: "base" | "insert" | "parallel" | "parallel_of_insert";
+    insertName?: string;
+    parallelName?: string;
+  }): Promise<{
+    availableOptions: {
+      sports?: Array<{ site: string; values: Array<{ label: string; value: string }> }>;
+      years?: Array<{ site: string; values: Array<{ label: string; value: string }> }>;
+      manufacturers?: Array<{ site: string; values: Array<{ label: string; value: string }> }>;
+      setNames?: Array<{ site: string; values: Array<{ label: string; value: string }> }>;
+      variantNames?: Array<{ site: string; values: Array<{ label: string; value: string }> }>;
+    };
+    currentParams: typeof partialParams;
+  }> {
+    try {
+      console.log(`[BSC Adapter] Getting available set parameters with filters:`, partialParams);
+      
+      if (!this.page) {
+        throw new Error('No Puppeteer page available for BSC scraping');
+      }
+
+      // Navigate to the BSC search page
+      const searchUrl = "https://www.buysportscards.com/seller/bulk-upload/results";
+      await this.page.goto(searchUrl, { waitUntil: "networkidle2" });
+      
+      // Wait for the page to load
+      await this.page.waitForSelector('body', { timeout: 10000 });
+      
+      // Extract available options based on current filters
+      const availableOptions: any = {};
+      
+      // For now, return mock data since the actual scraping logic would be complex
+      // In a real implementation, you would:
+      // 1. Check what filters are already applied
+      // 2. Look for dropdown options or form fields
+      // 3. Extract the available values
+      // 4. Return them in the expected format
+      
+      if (!partialParams.sport) {
+        // If no sport is selected, return available sports
+        availableOptions.sports = [{
+          site: "BSC",
+          values: [
+            { label: "Football", value: "football" },
+            { label: "Baseball", value: "baseball" },
+            { label: "Basketball", value: "basketball" },
+            { label: "Hockey", value: "hockey" },
+          ]
+        }];
+      } else if (!partialParams.year) {
+        // If sport is selected but no year, return available years
+        availableOptions.years = [{
+          site: "BSC",
+          values: [
+            { label: "2024", value: "2024" },
+            { label: "2023", value: "2023" },
+            { label: "2022", value: "2022" },
+            { label: "2021", value: "2021" },
+          ]
+        }];
+      } else if (!partialParams.manufacturer) {
+        // If sport and year are selected but no manufacturer, return available manufacturers
+        availableOptions.manufacturers = [{
+          site: "BSC",
+          values: [
+            { label: "Panini", value: "panini" },
+            { label: "Topps", value: "topps" },
+            { label: "Upper Deck", value: "upper-deck" },
+            { label: "Donruss", value: "donruss" },
+          ]
+        }];
+      } else if (!partialParams.setName) {
+        // If sport, year, and manufacturer are selected but no set name, return available set names
+        availableOptions.setNames = [{
+          site: "BSC",
+          values: [
+            { label: "Donruss Elite", value: "donruss-elite" },
+            { label: "Panini Prizm", value: "panini-prizm" },
+            { label: "Topps Chrome", value: "topps-chrome" },
+            { label: "Upper Deck Series 1", value: "upper-deck-series-1" },
+          ]
+        }];
+      } else if (!partialParams.variantType) {
+        // If all previous filters are selected but no variant type, return available variant types
+        availableOptions.variantNames = [{
+          site: "BSC",
+          values: [
+            { label: "Base", value: "base" },
+            { label: "Insert", value: "insert" },
+            { label: "Parallel", value: "parallel" },
+          ]
+        }];
+      }
+
+      return {
+        availableOptions,
+        currentParams: partialParams,
+      };
+    } catch (error) {
+      console.error(`[BSC Adapter] Error getting available set parameters:`, error);
+      throw error;
+    }
+  }
 }

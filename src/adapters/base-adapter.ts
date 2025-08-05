@@ -25,7 +25,7 @@ export abstract class BaseAdapter {
   }
 
   abstract getHomeUrl(): string;
-  abstract login(key: string): Promise<AdapterResponse>;
+abstract login(key: string): Promise<AdapterResponse>;
   
   protected async navigateToHome(): Promise<void> {
     try {
@@ -68,6 +68,14 @@ export abstract class BaseAdapter {
       await page.setViewport({ width: 1920, height: 1080 });
     }
     this.page = page;
+    
+    // Actually perform the login
+    const loginResult = await this.login(key);
+    console.log(`[Base Adapter] Login Result:`, loginResult);
+    if (!loginResult.success) {
+      throw new Error(`Failed to login to ${this.siteName}: ${loginResult.error}`);
+    }
+    
     return { page };
   }
 } 
