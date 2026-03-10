@@ -44,4 +44,7 @@ pids
 coverage/
 
 # nyc test coverage
-.nyc_output 
+.nyc_output
+
+# Temporary files
+tmp/ 

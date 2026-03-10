@@ -49,9 +49,6 @@ export class BSCAdapter extends BaseAdapter {
       await bscPage.goto(this.getHomeUrl(), { waitUntil: "networkidle2" });
       console.log(`[BSC Adapter] Successfully navigated to home page`);
 
-      // take a screenshot of the page
-      await bscPage.screenshot({ path: "screenshot.png" });
-
       // Look for Sign In button first (most common case)
       console.log(`[BSC Adapter] Looking for Sign In button...`);
       let signInClicked = false;
