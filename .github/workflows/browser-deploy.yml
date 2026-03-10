@@ -51,3 +51,44 @@ jobs:
           image: gcr.io/${{ env.GCP_PROJECT }}/neonbinder-browser:${{ github.sha }}
           project_id: ${{ env.GCP_PROJECT }}
           env_vars: ENVIRONMENT=${{ env.ENV_NAME }}
+
+  smoke-test:
+    needs: deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set environment
+        run: |
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            echo "ENV_NAME=prod" >> $GITHUB_ENV
+            echo "GCP_PROJECT=neonbinder-484017" >> $GITHUB_ENV
+            echo "SMOKE_TEST_URL=https://neonbinder-browser-5pwyyc5gzq-uc.a.run.app" >> $GITHUB_ENV
+          else
+            echo "ENV_NAME=dev" >> $GITHUB_ENV
+            echo "GCP_PROJECT=neonbinder-dev-io" >> $GITHUB_ENV
+            echo "SMOKE_TEST_URL=https://neonbinder-browser-jjwqo53dra-uc.a.run.app" >> $GITHUB_ENV
+          fi
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.ENV_NAME == 'prod' && secrets.GCP_WIF_PROVIDER || secrets.GCP_WIF_PROVIDER_DEV }}
+          service_account: ${{ env.ENV_NAME == 'prod' && secrets.GCP_SERVICE_ACCOUNT_DEPLOYER || secrets.GCP_SERVICE_ACCOUNT_DEPLOYER_DEV }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Fetch API key from Secret Manager
+        run: |
+          echo "SMOKE_TEST_API_KEY=$(gcloud secrets versions access latest --secret=internal-api-key --project=${{ env.GCP_PROJECT }})" >> $GITHUB_ENV
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Run smoke tests
+        run: node --test tests/smoke.test.mjs
