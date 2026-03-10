@@ -45,6 +45,12 @@ RUN npm run build
 RUN npm prune --production
 RUN rm -rf src/ tsconfig.json
 
+# Create non-root user for running Puppeteer
+RUN groupadd -r pptruser && useradd -r -g pptruser -G audio,video pptruser \
+    && mkdir -p /home/pptruser && chown -R pptruser:pptruser /home/pptruser /app
+
+USER pptruser
+
 # Expose port
 EXPOSE 8080
 

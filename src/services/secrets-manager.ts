@@ -7,15 +7,24 @@ export interface Credentials {
   expiresAt?: number;
 }
 
+const KEY_PATTERN = /^[a-z0-9]+-credentials-[a-zA-Z0-9_-]+$/;
+
+function validateKeyFormat(key: string): void {
+  if (!KEY_PATTERN.test(key)) {
+    throw new Error("Invalid credential key format");
+  }
+}
+
 export class SecretsManagerService {
   private client: SecretManagerServiceClient;
   private projectId: string;
 
   constructor() {
     this.client = new SecretManagerServiceClient();
-    this.projectId = process.env.GOOGLE_CLOUD_PROJECT || 'neonbinder';
+    this.projectId = process.env.GOOGLE_CLOUD_PROJECT || 'neonbinder-484017';
   }
   async getCredentials(key: string): Promise<Credentials> {
+    validateKeyFormat(key);
     try {
       const secretName = `projects/${this.projectId}/secrets/${key}`;
       
@@ -50,7 +59,8 @@ export class SecretsManagerService {
         expiresAt: credentials.expiresAt
       };
     } catch (error) {
-      throw new Error(`Failed to retrieve credentials for key '${key}': ${error}`);
+      console.error(`Failed to retrieve credentials for key '${key}':`, error);
+      throw new Error(`Failed to retrieve credentials`);
     }
   }
 
@@ -74,7 +84,34 @@ export class SecretsManagerService {
    * Updates (adds a new version to) the secret with the given key, storing the provided credentials object as JSON.
    * If the secret does not exist, it will be created.
    */
+  async deleteCredentials(key: string): Promise<void> {
+    validateKeyFormat(key);
+    const secretName = `projects/${this.projectId}/secrets/${key}`;
+    try {
+      await this.client.deleteSecret({ name: secretName });
+    } catch (err: any) {
+      // If the secret doesn't exist, treat as success
+      if (err.code === 5 || (err.message && err.message.includes('not found'))) {
+        return;
+      }
+      console.error(`Failed to delete credentials for key '${key}':`, err);
+      throw new Error(`Failed to delete credentials`);
+    }
+  }
+
+  async credentialsExist(key: string): Promise<boolean> {
+    validateKeyFormat(key);
+    const secretName = `projects/${this.projectId}/secrets/${key}`;
+    try {
+      const [versions] = await this.client.listSecretVersions({ parent: secretName });
+      return versions.some(v => v.state === 'ENABLED');
+    } catch {
+      return false;
+    }
+  }
+
   async updateCredentials(key: string, credentials: Credentials): Promise<void> {
+    validateKeyFormat(key);
     const secretId = key;
     const parent = `projects/${this.projectId}`;
     const secretName = `${parent}/secrets/${secretId}`;
@@ -102,7 +139,8 @@ export class SecretsManagerService {
           payload: { data: Buffer.from(payload, 'utf8') },
         });
       } else {
-        throw new Error(`Failed to update credentials for key '${key}': ${err}`);
+        console.error(`Failed to update credentials for key '${key}':`, err);
+        throw new Error(`Failed to update credentials`);
       }
     }
   }

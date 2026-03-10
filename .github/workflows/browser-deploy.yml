@@ -2,7 +2,7 @@ name: Deploy Browser Service
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   workflow_dispatch:
 
 jobs:
@@ -15,11 +15,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set environment
+        run: |
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            echo "ENV_NAME=prod" >> $GITHUB_ENV
+            echo "GCP_PROJECT=neonbinder-484017" >> $GITHUB_ENV
+          else
+            echo "ENV_NAME=dev" >> $GITHUB_ENV
+            echo "GCP_PROJECT=neonbinder-dev-io" >> $GITHUB_ENV
+          fi
+
       - id: auth
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          workload_identity_provider: ${{ env.ENV_NAME == 'prod' && secrets.GCP_WIF_PROVIDER || secrets.GCP_WIF_PROVIDER_DEV }}
+          service_account: ${{ env.ENV_NAME == 'prod' && secrets.GCP_SERVICE_ACCOUNT_DEPLOYER || secrets.GCP_SERVICE_ACCOUNT_DEPLOYER_DEV }}
 
       - uses: google-github-actions/setup-gcloud@v2
 
@@ -29,13 +39,15 @@ jobs:
       - name: Build and push Docker image
         run: |
           docker build -f Dockerfile.prod \
-            -t gcr.io/${{ secrets.GCP_PROJECT_ID }}/neonbinder-browser:latest \
-            -t gcr.io/${{ secrets.GCP_PROJECT_ID }}/neonbinder-browser:${{ github.sha }} \
+            -t gcr.io/${{ env.GCP_PROJECT }}/neonbinder-browser:latest \
+            -t gcr.io/${{ env.GCP_PROJECT }}/neonbinder-browser:${{ github.sha }} \
             .
-          docker push gcr.io/${{ secrets.GCP_PROJECT_ID }}/neonbinder-browser --all-tags
+          docker push gcr.io/${{ env.GCP_PROJECT }}/neonbinder-browser --all-tags
 
       - uses: google-github-actions/deploy-cloudrun@v2
         with:
           service: neonbinder-browser
           region: us-central1
-          image: gcr.io/${{ secrets.GCP_PROJECT_ID }}/neonbinder-browser:${{ github.sha }}
+          image: gcr.io/${{ env.GCP_PROJECT }}/neonbinder-browser:${{ github.sha }}
+          project_id: ${{ env.GCP_PROJECT }}
+          env_vars: ENVIRONMENT=${{ env.ENV_NAME }}

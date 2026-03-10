@@ -1,6 +1,11 @@
-import express, { Request, Response } from "express";
+import express, { Request, Response, NextFunction } from "express";
+import { timingSafeEqual } from "crypto";
+import rateLimit from "express-rate-limit";
+import helmet from "helmet";
 import { SiteType, SUPPORTED_SITES } from "./adapters";
 import { SportlotsAdapter } from "./adapters/sportlots-adapter";
+import { BSCAdapter } from "./adapters/bsc-adapter";
+import { SecretsManagerService } from "./services/secrets-manager";
 
 interface LoginRequest {
   site: SiteType;
@@ -10,6 +15,8 @@ interface LoginRequest {
 interface LoginResponse {
   success: boolean;
   message?: string;
+  token?: string;
+  expiresAt?: number;
 }
 
 interface ErrorResponse {
@@ -45,16 +52,52 @@ interface GetSelectorOptionsResponse {
   }>;
 }
 
+const ENV = process.env.ENVIRONMENT || "dev";
 const app = express();
-app.use(express.json());
 
-// Get list of supported sites
-app.get("/sites", (_req: Request, res: Response<SitesResponse>) => {
+// Security middleware
+app.use(helmet());
+app.use(express.json({ limit: "10kb" }));
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 60 * 1000,  // 1 minute
+  max: 30,               // 30 requests per minute
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use(limiter);
+
+// --- Timing-safe authentication middleware ---
+function requireInternalAuth(req: Request, res: Response, next: NextFunction): void {
+  const apiKey = req.headers["x-internal-key"];
+  const expected = process.env.INTERNAL_API_KEY;
+
+  if (
+    !apiKey ||
+    !expected ||
+    typeof apiKey !== "string" ||
+    apiKey.length !== expected.length ||
+    !timingSafeEqual(Buffer.from(apiKey), Buffer.from(expected))
+  ) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+  next();
+}
+
+// Health endpoint
+app.get("/health", (_req: Request, res: Response) => {
+  res.json({ status: "ok", environment: ENV });
+});
+
+// Get list of supported sites (requires auth)
+app.get("/sites", requireInternalAuth, (_req: Request, res: Response<SitesResponse>) => {
   res.json({ sites: SUPPORTED_SITES });
 });
 
 // Login to a specific site
-app.post("/login", async (req: Request<{}, {}, LoginRequest>, res: Response<LoginResponse | ErrorResponse>) => {
+app.post("/login", requireInternalAuth, async (req: Request<{}, {}, LoginRequest>, res: Response<LoginResponse | ErrorResponse>) => {
   const { site, key } = req.body;
   try {
     let adapter;
@@ -68,7 +111,7 @@ app.post("/login", async (req: Request<{}, {}, LoginRequest>, res: Response<Logi
     if (result.success) {
       res.json({ success: true, message: result.message });
     } else {
-      res.status(500).json({ error: result.error || "Login failed" });
+      res.status(500).json({ error: "Login failed" });
     }
   } catch (err) {
     console.error("Login failed:", err);
@@ -77,15 +120,53 @@ app.post("/login", async (req: Request<{}, {}, LoginRequest>, res: Response<Logi
 });
 
 // Site-specific login endpoints
-app.post("/login/sportlots", async (req: Request<{}, {}, { key: string }>, res: Response<LoginResponse | ErrorResponse>) => {
-  const { key } = req.body;
+app.post("/login/sportlots", requireInternalAuth, async (req: Request<{}, {}, { key: string; username?: string; password?: string }>, res: Response<LoginResponse | ErrorResponse>) => {
+  const { key, username, password } = req.body;
   try {
+    const secretsManager = new SecretsManagerService();
+
+    // If username/password provided, store in GCP and validate via HTTP login
+    if (username && password) {
+      await secretsManager.updateCredentials(key, { username, password });
+
+      // Validate by doing a direct HTTP POST to SportLots login URL
+      const loginUrl = "https://www.sportlots.com/cust/custbin/login.tpl";
+      const body = new URLSearchParams({
+        email_val: username,
+        psswd: password,
+      });
+
+      const response = await fetch(loginUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: body.toString(),
+        redirect: "manual",
+      });
+
+      const setCookieHeaders = response.headers.getSetCookie?.() || [];
+      const hasCookie = setCookieHeaders.length > 0 || !!response.headers.get("set-cookie");
+
+      if (hasCookie) {
+        res.json({ success: true, message: "SportLots credentials saved and validated successfully" });
+      } else {
+        // Credentials stored but login validation failed — remove them
+        try {
+          await secretsManager.deleteCredentials(key);
+        } catch {
+          // Best effort cleanup
+        }
+        res.status(400).json({ error: "SportLots login validation failed. Please check your credentials." });
+      }
+      return;
+    }
+
+    // If only key: read from GCP and validate (backward compatible)
     const adapter = new SportlotsAdapter(undefined);
     const result = await adapter.login(key);
     if (result.success) {
       res.json({ success: true, message: result.message });
     } else {
-      res.status(500).json({ error: result.error || "Login failed" });
+      res.status(500).json({ error: "Login failed" });
     }
   } catch (err) {
     console.error("Sportlots login failed:", err);
@@ -93,83 +174,90 @@ app.post("/login/sportlots", async (req: Request<{}, {}, { key: string }>, res: 
   }
 });
 
-/**
- * Get selector options from SportLots
- * 
- * This endpoint scrapes the SportLots website to retrieve available options for the hierarchical set building process.
- * It requires authentication via loginKey and supports filtering based on previously selected parameters.
- * 
- * @example
- * // Get all available sports
- * curl -X POST "http://localhost:8080/get-selector-options" \
- *   -H "Content-Type: application/json" \
- *   -d '{"level": "sport", "loginKey": "sportlots-credentials-jx79mrchxfk068z36fkah2sf2s7jpnma"}'
- * 
- * @example
- * // Get available years for Football
- * curl -X POST "http://localhost:8080/get-selector-options" \
- *   -H "Content-Type: application/json" \
- *   -d '{"level": "year", "parentFilters": {"sport": "Football"}, "loginKey": "sportlots-credentials-jx79mrchxfk068z36fkah2sf2s7jpnma"}'
- * 
- * @example
- * // Get available manufacturers for Football 2022
- * curl -X POST "http://localhost:8080/get-selector-options" \
- *   -H "Content-Type: application/json" \
- *   -d '{"level": "manufacturer", "parentFilters": {"sport": "Football", "year": "2022"}, "loginKey": "sportlots-credentials-jx79mrchxfk068z36fkah2sf2s7jpnma"}'
- * 
- * @param {string} level - The hierarchical level to retrieve options for. Must be one of: "sport", "year", "manufacturer", "setName", "variantType", "insert", "parallel"
- * @param {Object} [parentFilters] - Optional filters based on previously selected values
- * @param {string} [parentFilters.sport] - Selected sport (e.g., "Football", "Baseball")
- * @param {number} [parentFilters.year] - Selected year (e.g., 2022, 2023)
- * @param {string} [parentFilters.manufacturer] - Selected manufacturer (e.g., "Donruss", "Bowman")
- * @param {string} [parentFilters.setName] - Selected set name
- * @param {string} [parentFilters.variantType] - Selected variant type ("base", "parallel", "insert", "parallel_of_insert")
- * @param {string} loginKey - The secret key for SportLots credentials stored in Google Secret Manager
- * 
- * @returns {Object} Response object containing:
- *   - success: boolean - Whether the operation was successful
- *   - message: string - Human-readable message about the operation
- *   - optionsCount: number - Number of options found
- *   - options: Array<{value: string, platformData: {sportlots: string}}> - Array of available options
- * 
- * @example Response for sports:
- * {
- *   "success": true,
- *   "message": "Successfully found 5 sport options from SportLots",
- *   "optionsCount": 5,
- *   "options": [
- *     {"value": "Baseball", "platformData": {"sportlots": "BB"}},
- *     {"value": "Basketball", "platformData": {"sportlots": "BK"}},
- *     {"value": "Football", "platformData": {"sportlots": "FB"}},
- *     {"value": "Golf", "platformData": {"sportlots": "GF"}},
- *     {"value": "Hockey", "platformData": {"sportlots": "HK"}}
- *   ]
- * }
- * 
- * @example Response for manufacturers:
- * {
- *   "success": true,
- *   "message": "Successfully found 13 manufacturer options from SportLots",
- *   "optionsCount": 13,
- *   "options": [
- *     {"value": "Bowman", "platformData": {"sportlots": "Bowman"}},
- *     {"value": "Donruss", "platformData": {"sportlots": "Donruss"}},
- *     {"value": "Fleer", "platformData": {"sportlots": "Fleer"}},
- *     {"value": "ITG", "platformData": {"sportlots": "ITG"}}
- *   ]
- * }
- * 
- * @throws {Error} When login fails or SportLots scraping encounters an error
- * @throws {Error} When loginKey is invalid or credentials are not found
- * 
- * @note This endpoint requires the browser service to be running and authenticated with SportLots
- * @note The loginKey must correspond to a valid secret in Google Secret Manager containing SportLots credentials
- * @note SportLots uses different internal values (e.g., "FB" for Football) which are stored in platformData
- */
-app.post("/get-selector-options", async (req: Request<{}, {}, GetSelectorOptionsRequest>, res: Response<GetSelectorOptionsResponse | ErrorResponse>) => {
+// BSC login endpoint: accepts username/password, stores in GCP, logs in via Puppeteer, returns token
+app.post("/login/bsc", requireInternalAuth, async (req: Request<{}, {}, { key: string; username: string; password: string }>, res: Response<LoginResponse | ErrorResponse>) => {
+  const { key, username, password } = req.body;
+  if (!key || !username || !password) {
+    res.status(400).json({ error: "Missing required fields: key, username, password" });
+    return;
+  }
+  try {
+    // Store credentials in GCP Secret Manager first
+    const secretsManager = new SecretsManagerService();
+    await secretsManager.updateCredentials(key, { username, password });
+
+    // Now use the BSC adapter to log in and extract the token
+    const adapter = new BSCAdapter(undefined);
+    const result = await adapter.login(key);
+    if (result.success) {
+      res.json({
+        success: true,
+        message: result.message,
+        token: result.token,
+        expiresAt: result.expiresAt,
+      });
+    } else {
+      res.status(500).json({ error: "BSC login failed" });
+    }
+  } catch (err) {
+    console.error("BSC login failed:", err);
+    res.status(500).json({ error: "BSC login failed" });
+  }
+});
+
+// --- Credential CRUD endpoints ---
+
+// Get credentials for a key
+app.get("/credentials/:key", requireInternalAuth, async (req: Request<{ key: string }>, res: Response) => {
+  try {
+    const secretsManager = new SecretsManagerService();
+    const credentials = await secretsManager.getCredentials(req.params.key);
+    res.json(credentials);
+  } catch (err) {
+    console.error("Failed to retrieve credentials:", err);
+    const message = err instanceof Error ? err.message : "Unknown error";
+    if (message.includes("not found") || message.includes("No active version")) {
+      res.status(404).json({ error: "Credentials not found" });
+    } else {
+      res.status(500).json({ error: "Failed to retrieve credentials" });
+    }
+  }
+});
+
+// Delete credentials for a key
+app.delete("/credentials/:key", requireInternalAuth, async (req: Request<{ key: string }>, res: Response) => {
+  try {
+    const secretsManager = new SecretsManagerService();
+    await secretsManager.deleteCredentials(req.params.key);
+    res.json({ success: true, message: "Credentials deleted" });
+  } catch (err) {
+    console.error("Failed to delete credentials:", err);
+    res.status(500).json({ error: "Failed to delete credentials" });
+  }
+});
+
+// Check which keys have credentials
+app.post("/credentials/check", requireInternalAuth, async (req: Request<{}, {}, { keys: string[] }>, res: Response) => {
+  try {
+    const secretsManager = new SecretsManagerService();
+    const results: Record<string, boolean> = {};
+    await Promise.all(
+      req.body.keys.map(async (key) => {
+        results[key] = await secretsManager.credentialsExist(key);
+      })
+    );
+    res.json({ results });
+  } catch (err) {
+    console.error("Failed to check credentials:", err);
+    res.status(500).json({ error: "Failed to check credentials" });
+  }
+});
+
+// --- Selector options endpoint ---
+app.post("/get-selector-options", requireInternalAuth, async (req: Request<{}, {}, GetSelectorOptionsRequest>, res: Response<GetSelectorOptionsResponse | ErrorResponse>) => {
   try {
     const { level, parentFilters, loginKey } = req.body;
-    
+
     console.log(`[get-selector-options] Getting ${level} options from SportLots with filters:`, parentFilters);
 
     // Get options from SportLots
@@ -177,18 +265,18 @@ app.post("/get-selector-options", async (req: Request<{}, {}, GetSelectorOptions
     try {
       const sportlotsAdapter = new SportlotsAdapter(undefined);
       const sportlotsResult = await sportlotsAdapter.getAvailableSetParameters(parentFilters || {}, loginKey);
-      
+
       if (sportlotsResult.availableOptions) {
-        const levelKey = level === "sport" ? "sports" : 
-                        level === "year" ? "years" : 
-                        level === "manufacturer" ? "manufacturers" : 
-                        level === "setName" ? "setNames" : 
-                        level === "variantType" ? "variantNames" : 
+        const levelKey = level === "sport" ? "sports" :
+                        level === "year" ? "years" :
+                        level === "manufacturer" ? "manufacturers" :
+                        level === "setName" ? "setNames" :
+                        level === "variantType" ? "variantNames" :
                         level;
-        
+
         const options = sportlotsResult.availableOptions[levelKey as keyof typeof sportlotsResult.availableOptions];
         if (options && Array.isArray(options) && options.length > 0) {
-          sportlotsOptions = options.flatMap((siteOption: any) => 
+          sportlotsOptions = options.flatMap((siteOption: any) =>
             siteOption.values.map((value: any) => ({
               value: value.label,
               platformData: { sportlots: value.value }
@@ -201,7 +289,7 @@ app.post("/get-selector-options", async (req: Request<{}, {}, GetSelectorOptions
     }
 
     console.log(`[get-selector-options] Successfully found ${sportlotsOptions.length} ${level} options from SportLots`);
-    
+
     res.json({
       success: true,
       message: `Successfully found ${sportlotsOptions.length} ${level} options from SportLots`,
@@ -210,11 +298,9 @@ app.post("/get-selector-options", async (req: Request<{}, {}, GetSelectorOptions
     });
   } catch (error) {
     console.error(`[get-selector-options] Error:`, error);
-    res.status(500).json({ 
-      error: `Failed to get selector options: ${error instanceof Error ? error.message : 'Unknown error'}` 
-    });
+    res.status(500).json({ error: "Failed to get selector options" });
   }
 });
 
 const PORT: number = parseInt(process.env.PORT || "8080", 10);
-app.listen(PORT, () => console.log(`Listening on port ${PORT}`)); 
+app.listen(PORT, () => console.log(`[${ENV}] Listening on port ${PORT}`));
