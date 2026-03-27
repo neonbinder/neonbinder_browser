@@ -40,7 +40,6 @@ export class BSCAdapter extends BaseAdapter {
           success: true,
           message: `Used cached token for ${this.siteName}`,
           storeName,
-          token: result.token,
           expiresAt: Date.now() + (60 * 60 * 1000),
         };
       }
