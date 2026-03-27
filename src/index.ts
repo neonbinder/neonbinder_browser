@@ -96,6 +96,20 @@ app.post("/login/sportlots", requireInternalAuth, async (req: Request<{}, {}, { 
       redirect: "manual",
     });
 
+    // Check for upstream failures before parsing cookies
+    if (response.status === 429) {
+      res.status(429).json({ error: "SportLots rate limit exceeded. Please try again later." });
+      return;
+    }
+    if (response.status >= 500) {
+      res.status(502).json({ error: `SportLots is unavailable (HTTP ${response.status}). Please try again later.` });
+      return;
+    }
+    if (response.status >= 400) {
+      res.status(502).json({ error: `SportLots returned an error (HTTP ${response.status}).` });
+      return;
+    }
+
     // SportLots sets cookies via JavaScript in the response body, not HTTP headers
     const responseBody = await response.text();
     const cookieRegex = /document\.cookie\s*=\s*"([^"]+)"/g;

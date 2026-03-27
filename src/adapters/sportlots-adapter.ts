@@ -39,6 +39,17 @@ export class SportlotsAdapter extends BaseAdapter {
         redirect: "manual",
       });
 
+      // Check for upstream failures before parsing cookies
+      if (response.status === 429) {
+        return { success: false, error: "SportLots rate limit exceeded. Please try again later." };
+      }
+      if (response.status >= 500) {
+        return { success: false, error: `SportLots is unavailable (HTTP ${response.status}). Please try again later.` };
+      }
+      if (response.status >= 400) {
+        return { success: false, error: `SportLots returned an error (HTTP ${response.status}).` };
+      }
+
       const responseBody = await response.text();
 
       // SportLots sets cookies via JavaScript in the response body
