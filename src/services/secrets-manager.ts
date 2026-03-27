@@ -21,7 +21,7 @@ export class SecretsManagerService {
 
   constructor() {
     this.client = new SecretManagerServiceClient();
-    this.projectId = process.env.GOOGLE_CLOUD_PROJECT || 'neonbinder-484017';
+    this.projectId = process.env.GOOGLE_CLOUD_PROJECT || 'neonbinder';
   }
   async getCredentials(key: string): Promise<Credentials> {
     validateKeyFormat(key);
@@ -58,8 +58,17 @@ export class SecretsManagerService {
         token: credentials.token,
         expiresAt: credentials.expiresAt
       };
-    } catch (error) {
+    } catch (error: any) {
       console.error(`Failed to retrieve credentials for key '${key}':`, error);
+      if (error.code === 5 || (error.message && error.message.includes('not found'))) {
+        throw new Error(`Credentials not found for key: ${key}`);
+      }
+      if (error.message && error.message.includes('No active version')) {
+        throw new Error(`No active version found for key: ${key}`);
+      }
+      if (error.message && error.message.includes('Invalid credential key format')) {
+        throw error;
+      }
       throw new Error(`Failed to retrieve credentials`);
     }
   }

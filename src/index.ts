@@ -2,21 +2,16 @@ import express, { Request, Response, NextFunction } from "express";
 import { timingSafeEqual } from "crypto";
 import rateLimit from "express-rate-limit";
 import helmet from "helmet";
-import { SiteType, SUPPORTED_SITES } from "./adapters";
-import { SportlotsAdapter } from "./adapters/sportlots-adapter";
+import { SUPPORTED_SITES } from "./adapters";
 import { BSCAdapter } from "./adapters/bsc-adapter";
 import { SecretsManagerService } from "./services/secrets-manager";
-
-interface LoginRequest {
-  site: SiteType;
-  key: string;
-}
 
 interface LoginResponse {
   success: boolean;
   message?: string;
   token?: string;
   expiresAt?: number;
+  storeName?: string;
 }
 
 interface ErrorResponse {
@@ -27,33 +22,13 @@ interface SitesResponse {
   sites: Record<string, string>;
 }
 
-// SportLots selector options endpoint
-interface GetSelectorOptionsRequest {
-  level: "sport" | "year" | "manufacturer" | "setName" | "variantType" | "insert" | "parallel";
-  parentFilters?: {
-    sport?: string;
-    year?: number;
-    manufacturer?: string;
-    setName?: string;
-    variantType?: "base" | "parallel" | "insert" | "parallel_of_insert";
-  };
-  loginKey: string; // Add login key parameter
-}
-
-interface GetSelectorOptionsResponse {
-  success: boolean;
-  message: string;
-  optionsCount: number;
-  options: Array<{
-    value: string;
-    platformData: {
-      sportlots: string;
-    };
-  }>;
-}
-
 const ENV = process.env.ENVIRONMENT || "dev";
 const app = express();
+
+// Trust proxy headers from Cloud Run / load balancers (not in dev — breaks express-rate-limit)
+if (ENV !== "dev") {
+  app.set("trust proxy", true);
+}
 
 // Security middleware
 app.use(helmet());
@@ -65,6 +40,7 @@ const limiter = rateLimit({
   max: 30,               // 30 requests per minute
   standardHeaders: true,
   legacyHeaders: false,
+  validate: ENV === "dev" ? { xForwardedForHeader: false, trustProxy: false } : true,
 });
 app.use(limiter);
 
@@ -96,78 +72,70 @@ app.get("/sites", requireInternalAuth, (_req: Request, res: Response<SitesRespon
   res.json({ sites: SUPPORTED_SITES });
 });
 
-// Login to a specific site
-app.post("/login", requireInternalAuth, async (req: Request<{}, {}, LoginRequest>, res: Response<LoginResponse | ErrorResponse>) => {
-  const { site, key } = req.body;
-  try {
-    let adapter;
-    if (site === 'sportlots') {
-      adapter = new SportlotsAdapter(undefined);
-    } else {
-      res.status(400).json({ error: `Unsupported site: ${site}` });
-      return;
-    }
-    const result = await adapter.login(key);
-    if (result.success) {
-      res.json({ success: true, message: result.message });
-    } else {
-      res.status(500).json({ error: "Login failed" });
-    }
-  } catch (err) {
-    console.error("Login failed:", err);
-    res.status(500).json({ error: "Login failed" });
-  }
-});
-
 // Site-specific login endpoints
-app.post("/login/sportlots", requireInternalAuth, async (req: Request<{}, {}, { key: string; username?: string; password?: string }>, res: Response<LoginResponse | ErrorResponse>) => {
+app.post("/login/sportlots", requireInternalAuth, async (req: Request<{}, {}, { key: string; username: string; password: string }>, res: Response<LoginResponse | ErrorResponse>) => {
   const { key, username, password } = req.body;
+  if (!key || !username || !password) {
+    res.status(400).json({ error: "Missing required fields: key, username, password" });
+    return;
+  }
   try {
     const secretsManager = new SecretsManagerService();
 
-    // If username/password provided, store in GCP and validate via HTTP login
-    if (username && password) {
-      await secretsManager.updateCredentials(key, { username, password });
+    // POST credentials to SportLots sign-in
+    const loginUrl = "https://www.sportlots.com/cust/custbin/signin.tpl";
+    const body = new URLSearchParams({
+      email_val: username,
+      psswd: password,
+    });
 
-      // Validate by doing a direct HTTP POST to SportLots login URL
-      const loginUrl = "https://www.sportlots.com/cust/custbin/login.tpl";
-      const body = new URLSearchParams({
-        email_val: username,
-        psswd: password,
-      });
+    const response = await fetch(loginUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: body.toString(),
+      redirect: "manual",
+    });
 
-      const response = await fetch(loginUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: body.toString(),
-        redirect: "manual",
-      });
+    // SportLots sets cookies via JavaScript in the response body, not HTTP headers
+    const responseBody = await response.text();
+    const cookieRegex = /document\.cookie\s*=\s*"([^"]+)"/g;
+    const cookies: string[] = [];
+    let cookieMatch;
 
-      const setCookieHeaders = response.headers.getSetCookie?.() || [];
-      const hasCookie = setCookieHeaders.length > 0 || !!response.headers.get("set-cookie");
-
-      if (hasCookie) {
-        res.json({ success: true, message: "SportLots credentials saved and validated successfully" });
-      } else {
-        // Credentials stored but login validation failed — remove them
-        try {
-          await secretsManager.deleteCredentials(key);
-        } catch {
-          // Best effort cleanup
-        }
-        res.status(400).json({ error: "SportLots login validation failed. Please check your credentials." });
+    while ((cookieMatch = cookieRegex.exec(responseBody)) !== null) {
+      // Each match is like: session_type=1;path=/;expires=...
+      // Extract just the name=value part (index 0 after splitting on ;)
+      const fullCookie = cookieMatch[1];
+      const nameValue = fullCookie.split(";")[0].trim();
+      if (nameValue) {
+        cookies.push(nameValue);
       }
+    }
+
+    if (cookies.length === 0) {
+      res.status(400).json({ error: "SportLots login failed. No session cookies received. Please check your credentials." });
       return;
     }
 
-    // If only key: read from GCP and validate (backward compatible)
-    const adapter = new SportlotsAdapter(undefined);
-    const result = await adapter.login(key);
-    if (result.success) {
-      res.json({ success: true, message: result.message });
-    } else {
-      res.status(500).json({ error: "Login failed" });
+    const cookieString = cookies.join("; ");
+
+    // Validate cookies work by fetching a protected page
+    const validateResponse = await fetch("https://www.sportlots.com/inven/dealbin/newinven.tpl", {
+      method: "GET",
+      headers: { Cookie: cookieString },
+      redirect: "manual",
+    });
+    const validateBody = await validateResponse.text();
+
+    if (validateBody.includes("login.tpl") || validateBody.includes("signin.tpl")) {
+      res.status(400).json({ error: "SportLots login validation failed. Cookies did not authenticate." });
+      return;
     }
+
+    // Store credentials + token in GCP
+    await secretsManager.updateCredentials(key, { username, password, token: cookieString });
+
+    res.json({ success: true, message: "SportLots credentials saved and validated successfully", token: cookieString });
   } catch (err) {
     console.error("Sportlots login failed:", err);
     res.status(500).json({ error: "Login failed" });
@@ -195,17 +163,41 @@ app.post("/login/bsc", requireInternalAuth, async (req: Request<{}, {}, { key: s
         message: result.message,
         token: result.token,
         expiresAt: result.expiresAt,
+        storeName: result.storeName,
       });
     } else {
-      res.status(500).json({ error: "BSC login failed" });
+      res.status(500).json({ error: result.error || result.message || "BSC login failed" });
     }
   } catch (err) {
     console.error("BSC login failed:", err);
-    res.status(500).json({ error: "BSC login failed" });
+    const detail = err instanceof Error ? err.message : "BSC login failed";
+    res.status(500).json({ error: detail });
   }
 });
 
 // --- Credential CRUD endpoints ---
+
+// Store credentials for a key (no marketplace validation)
+app.put("/credentials/:key", requireInternalAuth, async (req: Request<{ key: string }, {}, { username: string; password: string }>, res: Response) => {
+  const { username, password } = req.body;
+  if (!username || !password) {
+    res.status(400).json({ error: "Missing required fields: username, password" });
+    return;
+  }
+  try {
+    const secretsManager = new SecretsManagerService();
+    await secretsManager.updateCredentials(req.params.key, { username, password });
+    res.json({ success: true, message: "Credentials stored" });
+  } catch (err) {
+    console.error("Failed to store credentials:", err);
+    const message = err instanceof Error ? err.message : "Unknown error";
+    if (message.includes("Invalid credential key format")) {
+      res.status(400).json({ error: "Invalid credential key format" });
+    } else {
+      res.status(500).json({ error: "Failed to store credentials" });
+    }
+  }
+});
 
 // Get credentials for a key
 app.get("/credentials/:key", requireInternalAuth, async (req: Request<{ key: string }>, res: Response) => {
@@ -216,7 +208,9 @@ app.get("/credentials/:key", requireInternalAuth, async (req: Request<{ key: str
   } catch (err) {
     console.error("Failed to retrieve credentials:", err);
     const message = err instanceof Error ? err.message : "Unknown error";
-    if (message.includes("not found") || message.includes("No active version")) {
+    if (message.includes("Invalid credential key format")) {
+      res.status(400).json({ error: "Invalid credential key format" });
+    } else if (message.includes("not found") || message.includes("No active version")) {
       res.status(404).json({ error: "Credentials not found" });
     } else {
       res.status(500).json({ error: "Failed to retrieve credentials" });
@@ -232,7 +226,12 @@ app.delete("/credentials/:key", requireInternalAuth, async (req: Request<{ key: 
     res.json({ success: true, message: "Credentials deleted" });
   } catch (err) {
     console.error("Failed to delete credentials:", err);
-    res.status(500).json({ error: "Failed to delete credentials" });
+    const message = err instanceof Error ? err.message : "Unknown error";
+    if (message.includes("Invalid credential key format")) {
+      res.status(400).json({ error: "Invalid credential key format" });
+    } else {
+      res.status(500).json({ error: "Failed to delete credentials" });
+    }
   }
 });
 
@@ -250,55 +249,6 @@ app.post("/credentials/check", requireInternalAuth, async (req: Request<{}, {}, 
   } catch (err) {
     console.error("Failed to check credentials:", err);
     res.status(500).json({ error: "Failed to check credentials" });
-  }
-});
-
-// --- Selector options endpoint ---
-app.post("/get-selector-options", requireInternalAuth, async (req: Request<{}, {}, GetSelectorOptionsRequest>, res: Response<GetSelectorOptionsResponse | ErrorResponse>) => {
-  try {
-    const { level, parentFilters, loginKey } = req.body;
-
-    console.log(`[get-selector-options] Getting ${level} options from SportLots with filters:`, parentFilters);
-
-    // Get options from SportLots
-    let sportlotsOptions: Array<{ value: string; platformData: any }> = [];
-    try {
-      const sportlotsAdapter = new SportlotsAdapter(undefined);
-      const sportlotsResult = await sportlotsAdapter.getAvailableSetParameters(parentFilters || {}, loginKey);
-
-      if (sportlotsResult.availableOptions) {
-        const levelKey = level === "sport" ? "sports" :
-                        level === "year" ? "years" :
-                        level === "manufacturer" ? "manufacturers" :
-                        level === "setName" ? "setNames" :
-                        level === "variantType" ? "variantNames" :
-                        level;
-
-        const options = sportlotsResult.availableOptions[levelKey as keyof typeof sportlotsResult.availableOptions];
-        if (options && Array.isArray(options) && options.length > 0) {
-          sportlotsOptions = options.flatMap((siteOption: any) =>
-            siteOption.values.map((value: any) => ({
-              value: value.label,
-              platformData: { sportlots: value.value }
-            }))
-          );
-        }
-      }
-    } catch (error) {
-      console.error(`[get-selector-options] SportLots error:`, error);
-    }
-
-    console.log(`[get-selector-options] Successfully found ${sportlotsOptions.length} ${level} options from SportLots`);
-
-    res.json({
-      success: true,
-      message: `Successfully found ${sportlotsOptions.length} ${level} options from SportLots`,
-      optionsCount: sportlotsOptions.length,
-      options: sportlotsOptions,
-    });
-  } catch (error) {
-    console.error(`[get-selector-options] Error:`, error);
-    res.status(500).json({ error: "Failed to get selector options" });
   }
 });
 

@@ -11,6 +11,7 @@ export interface AdapterResponse {
   message?: string;
   error?: string;
   token?: string;
+  storeName?: string;
   expiresAt?: number;
 }
 
