@@ -4,6 +4,7 @@ import rateLimit from "express-rate-limit";
 import helmet from "helmet";
 import { SUPPORTED_SITES } from "./adapters";
 import { BSCAdapter } from "./adapters/bsc-adapter";
+import { SportlotsAdapter } from "./adapters/sportlots-adapter";
 import { SecretsManagerService } from "./services/secrets-manager";
 
 interface LoginResponse {
@@ -79,76 +80,18 @@ app.post("/login/sportlots", requireInternalAuth, async (req: Request<{}, {}, { 
     return;
   }
   try {
+    // Store credentials in GCP Secret Manager first
     const secretsManager = new SecretsManagerService();
+    await secretsManager.updateCredentials(key, { username, password });
 
-    // POST credentials to SportLots sign-in
-    const loginUrl = "https://www.sportlots.com/cust/custbin/signin.tpl";
-    const body = new URLSearchParams({
-      email_val: username,
-      psswd: password,
-    });
-
-    const response = await fetch(loginUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: body.toString(),
-      redirect: "manual",
-    });
-
-    // Check for upstream failures before parsing cookies
-    if (response.status === 429) {
-      res.status(429).json({ error: "SportLots rate limit exceeded. Please try again later." });
-      return;
+    // Use the adapter to login, validate cookies, and store token
+    const adapter = new SportlotsAdapter(undefined);
+    const result = await adapter.login(key);
+    if (result.success) {
+      res.json({ success: true, message: result.message });
+    } else {
+      res.status(400).json({ error: result.error || "SportLots login failed" });
     }
-    if (response.status >= 500) {
-      res.status(502).json({ error: `SportLots is unavailable (HTTP ${response.status}). Please try again later.` });
-      return;
-    }
-    if (response.status >= 400) {
-      res.status(502).json({ error: `SportLots returned an error (HTTP ${response.status}).` });
-      return;
-    }
-
-    // SportLots sets cookies via JavaScript in the response body, not HTTP headers
-    const responseBody = await response.text();
-    const cookieRegex = /document\.cookie\s*=\s*"([^"]+)"/g;
-    const cookies: string[] = [];
-    let cookieMatch;
-
-    while ((cookieMatch = cookieRegex.exec(responseBody)) !== null) {
-      // Each match is like: session_type=1;path=/;expires=...
-      // Extract just the name=value part (index 0 after splitting on ;)
-      const fullCookie = cookieMatch[1];
-      const nameValue = fullCookie.split(";")[0].trim();
-      if (nameValue) {
-        cookies.push(nameValue);
-      }
-    }
-
-    if (cookies.length === 0) {
-      res.status(400).json({ error: "SportLots login failed. No session cookies received. Please check your credentials." });
-      return;
-    }
-
-    const cookieString = cookies.join("; ");
-
-    // Validate cookies work by fetching a protected page
-    const validateResponse = await fetch("https://www.sportlots.com/inven/dealbin/newinven.tpl", {
-      method: "GET",
-      headers: { Cookie: cookieString },
-      redirect: "manual",
-    });
-    const validateBody = await validateResponse.text();
-
-    if (validateBody.includes("login.tpl") || validateBody.includes("signin.tpl")) {
-      res.status(400).json({ error: "SportLots login validation failed. Cookies did not authenticate." });
-      return;
-    }
-
-    // Store credentials + token in GCP
-    await secretsManager.updateCredentials(key, { username, password, token: cookieString });
-
-    res.json({ success: true, message: "SportLots credentials saved and validated successfully" });
   } catch (err) {
     console.error("Sportlots login failed:", err);
     res.status(500).json({ error: "Login failed" });

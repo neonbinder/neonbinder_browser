@@ -73,6 +73,21 @@ export class SportlotsAdapter extends BaseAdapter {
 
       const cookieString = cookies.join("; ");
 
+      // Validate cookies actually authenticate by fetching a protected page
+      const validateResponse = await fetch("https://www.sportlots.com/inven/dealbin/newinven.tpl", {
+        method: "GET",
+        headers: { Cookie: cookieString },
+        redirect: "manual",
+      });
+      const validateBody = await validateResponse.text();
+
+      if (validateBody.includes("login.tpl") || validateBody.includes("signin.tpl")) {
+        return {
+          success: false,
+          error: "SportLots login validation failed. Cookies did not authenticate.",
+        };
+      }
+
       // Store the cookie as a token
       await secretsManager.updateCredentials(key, {
         username: credentials.username,
@@ -83,7 +98,6 @@ export class SportlotsAdapter extends BaseAdapter {
       return {
         success: true,
         message: `Successfully logged into ${this.siteName}`,
-        token: cookieString,
       };
     } catch (error) {
       return {
