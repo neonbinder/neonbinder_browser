@@ -93,8 +93,13 @@ app.post("/login/sportlots", requireInternalAuth, async (req: Request<{}, {}, { 
       res.status(400).json({ error: result.error || "SportLots login failed" });
     }
   } catch (err) {
-    console.error("Sportlots login failed:", err);
-    res.status(500).json({ error: "Login failed" });
+    const message = err instanceof Error ? err.message : "Unknown error";
+    if (message.includes("Invalid credential key format")) {
+      res.status(400).json({ error: "Invalid credential key format" });
+    } else {
+      console.error("Sportlots login failed:", err);
+      res.status(500).json({ error: "Login failed" });
+    }
   }
 });
 
@@ -124,9 +129,13 @@ app.post("/login/bsc", requireInternalAuth, async (req: Request<{}, {}, { key: s
       res.status(500).json({ error: result.error || result.message || "BSC login failed" });
     }
   } catch (err) {
-    console.error("BSC login failed:", err);
-    const detail = err instanceof Error ? err.message : "BSC login failed";
-    res.status(500).json({ error: detail });
+    const message = err instanceof Error ? err.message : "Unknown error";
+    if (message.includes("Invalid credential key format")) {
+      res.status(400).json({ error: "Invalid credential key format" });
+    } else {
+      console.error("BSC login failed:", err);
+      res.status(500).json({ error: "BSC login failed" });
+    }
   }
 });
 

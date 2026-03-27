@@ -66,9 +66,6 @@ export class SecretsManagerService {
       if (error.message && error.message.includes('No active version')) {
         throw new Error(`No active version found for key: ${key}`);
       }
-      if (error.message && error.message.includes('Invalid credential key format')) {
-        throw error;
-      }
       throw new Error(`Failed to retrieve credentials`);
     }
   }
