@@ -9,7 +9,6 @@ import { SecretsManagerService } from "./services/secrets-manager";
 interface LoginResponse {
   success: boolean;
   message?: string;
-  token?: string;
   expiresAt?: number;
   storeName?: string;
 }
@@ -149,14 +148,14 @@ app.post("/login/sportlots", requireInternalAuth, async (req: Request<{}, {}, { 
     // Store credentials + token in GCP
     await secretsManager.updateCredentials(key, { username, password, token: cookieString });
 
-    res.json({ success: true, message: "SportLots credentials saved and validated successfully", token: cookieString });
+    res.json({ success: true, message: "SportLots credentials saved and validated successfully" });
   } catch (err) {
     console.error("Sportlots login failed:", err);
     res.status(500).json({ error: "Login failed" });
   }
 });
 
-// BSC login endpoint: accepts username/password, stores in GCP, logs in via Puppeteer, returns token
+// BSC login endpoint: accepts username/password, stores in GCP, logs in via Puppeteer
 app.post("/login/bsc", requireInternalAuth, async (req: Request<{}, {}, { key: string; username: string; password: string }>, res: Response<LoginResponse | ErrorResponse>) => {
   const { key, username, password } = req.body;
   if (!key || !username || !password) {
@@ -175,7 +174,6 @@ app.post("/login/bsc", requireInternalAuth, async (req: Request<{}, {}, { key: s
       res.json({
         success: true,
         message: result.message,
-        token: result.token,
         expiresAt: result.expiresAt,
         storeName: result.storeName,
       });
