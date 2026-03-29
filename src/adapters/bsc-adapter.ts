@@ -12,17 +12,36 @@ export class BSCAdapter extends BaseAdapter {
   }
 
   async login(key: string): Promise<AdapterResponse> {
-    // Fetch credentials internally
     const secretsManager = new SecretsManagerService();
-    // First, try to get a token or a page from loginWithBrowser
+    // First, check if we have a cached token or need a browser page
     const result = await this.loginWithBrowser(key);
-    if (result.token) {
-      console.log(`[BSC Adapter] Using cached token for ${this.siteName}`);
-      return {
-        success: true,
-        message: `Used cached token for ${this.siteName}`,
-        expiresAt: Date.now() + (60 * 60 * 1000), // Dummy expiry for now
-      };
+    if (result.cached) {
+      console.log(`[BSC Adapter] Validating cached token for ${this.siteName}...`);
+
+      const profileResponse = await fetch("https://api-prod.buysportscards.com/marketplace/user/profile", {
+        headers: { "Authorization": this.token! },
+      });
+
+      if (!profileResponse.ok) {
+        console.log(`[BSC Adapter] Cached token is invalid (${profileResponse.status}), clearing and re-authenticating...`);
+        const existing = await secretsManager.getCredentials(key);
+        await secretsManager.updateCredentials(key, {
+          ...existing,
+          token: undefined,
+          expiresAt: undefined,
+        });
+        // Fall through to Puppeteer login below
+      } else {
+        const profile = await profileResponse.json() as { sellerProfile?: { sellerStoreName?: string } };
+        const storeName = profile?.sellerProfile?.sellerStoreName;
+        console.log(`[BSC Adapter] Cached token valid. Store: ${storeName}`);
+        return {
+          success: true,
+          message: `Used cached token for ${this.siteName}`,
+          storeName,
+          expiresAt: Date.now() + (60 * 60 * 1000),
+        };
+      }
     }
     // If we have a page, continue with the BSC login process as before
     const bscPage = result.page || this.page;
@@ -159,7 +178,6 @@ export class BSCAdapter extends BaseAdapter {
         return {
           success: true,
           message: `Successfully logged into ${this.siteName}`,
-          token,
           expiresAt,
         };
       }
