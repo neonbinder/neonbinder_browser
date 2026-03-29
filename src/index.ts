@@ -73,18 +73,14 @@ app.get("/sites", requireInternalAuth, (_req: Request, res: Response<SitesRespon
 });
 
 // Site-specific login endpoints
-app.post("/login/sportlots", requireInternalAuth, async (req: Request<{}, {}, { key: string; username: string; password: string }>, res: Response<LoginResponse | ErrorResponse>) => {
-  const { key, username, password } = req.body;
-  if (!key || !username || !password) {
-    res.status(400).json({ error: "Missing required fields: key, username, password" });
+app.post("/login/sportlots", requireInternalAuth, async (req: Request<{}, {}, { key: string }>, res: Response<LoginResponse | ErrorResponse>) => {
+  const { key } = req.body;
+  if (!key) {
+    res.status(400).json({ error: "Missing required field: key" });
     return;
   }
   try {
-    // Store credentials in GCP Secret Manager first
-    const secretsManager = new SecretsManagerService();
-    await secretsManager.updateCredentials(key, { username, password });
-
-    // Use the adapter to login, validate cookies, and store token
+    // Adapter reads credentials from Secret Manager internally
     const adapter = new SportlotsAdapter(undefined);
     const result = await adapter.login(key);
     if (result.success) {
@@ -104,18 +100,14 @@ app.post("/login/sportlots", requireInternalAuth, async (req: Request<{}, {}, { 
 });
 
 // BSC login endpoint: accepts username/password, stores in GCP, logs in via Puppeteer
-app.post("/login/bsc", requireInternalAuth, async (req: Request<{}, {}, { key: string; username: string; password: string }>, res: Response<LoginResponse | ErrorResponse>) => {
-  const { key, username, password } = req.body;
-  if (!key || !username || !password) {
-    res.status(400).json({ error: "Missing required fields: key, username, password" });
+app.post("/login/bsc", requireInternalAuth, async (req: Request<{}, {}, { key: string }>, res: Response<LoginResponse | ErrorResponse>) => {
+  const { key } = req.body;
+  if (!key) {
+    res.status(400).json({ error: "Missing required field: key" });
     return;
   }
   try {
-    // Store credentials in GCP Secret Manager first
-    const secretsManager = new SecretsManagerService();
-    await secretsManager.updateCredentials(key, { username, password });
-
-    // Now use the BSC adapter to log in and extract the token
+    // Adapter reads credentials from Secret Manager internally
     const adapter = new BSCAdapter(undefined);
     const result = await adapter.login(key);
     if (result.success) {
@@ -163,21 +155,51 @@ app.put("/credentials/:key", requireInternalAuth, async (req: Request<{ key: str
   }
 });
 
-// Get credentials for a key
-app.get("/credentials/:key", requireInternalAuth, async (req: Request<{ key: string }>, res: Response) => {
+// Get credential metadata (no secrets) for a key
+app.get("/credentials/:key/metadata", requireInternalAuth, async (req: Request<{ key: string }>, res: Response) => {
   try {
     const secretsManager = new SecretsManagerService();
     const credentials = await secretsManager.getCredentials(req.params.key);
-    res.json(credentials);
+    res.json({
+      username: credentials.username,
+      hasToken: !!credentials.token,
+      expiresAt: credentials.expiresAt,
+    });
   } catch (err) {
-    console.error("Failed to retrieve credentials:", err);
     const message = err instanceof Error ? err.message : "Unknown error";
     if (message.includes("Invalid credential key format")) {
       res.status(400).json({ error: "Invalid credential key format" });
     } else if (message.includes("not found") || message.includes("No active version")) {
       res.status(404).json({ error: "Credentials not found" });
     } else {
-      res.status(500).json({ error: "Failed to retrieve credentials" });
+      console.error("Failed to retrieve credential metadata:", err);
+      res.status(500).json({ error: "Failed to retrieve credential metadata" });
+    }
+  }
+});
+
+// Get token only (for internal adapter use — no username/password exposed)
+app.get("/credentials/:key/token", requireInternalAuth, async (req: Request<{ key: string }>, res: Response) => {
+  try {
+    const secretsManager = new SecretsManagerService();
+    const credentials = await secretsManager.getCredentials(req.params.key);
+    if (!credentials.token) {
+      res.status(404).json({ error: "No token available" });
+      return;
+    }
+    res.json({
+      token: credentials.token,
+      expiresAt: credentials.expiresAt,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    if (message.includes("Invalid credential key format")) {
+      res.status(400).json({ error: "Invalid credential key format" });
+    } else if (message.includes("not found") || message.includes("No active version")) {
+      res.status(404).json({ error: "Credentials not found" });
+    } else {
+      console.error("Failed to retrieve token:", err);
+      res.status(500).json({ error: "Failed to retrieve token" });
     }
   }
 });

@@ -12,15 +12,14 @@ export class BSCAdapter extends BaseAdapter {
   }
 
   async login(key: string): Promise<AdapterResponse> {
-    // Fetch credentials internally
     const secretsManager = new SecretsManagerService();
-    // First, try to get a token or a page from loginWithBrowser
+    // First, check if we have a cached token or need a browser page
     const result = await this.loginWithBrowser(key);
-    if (result.token) {
+    if (result.cached) {
       console.log(`[BSC Adapter] Validating cached token for ${this.siteName}...`);
 
       const profileResponse = await fetch("https://api-prod.buysportscards.com/marketplace/user/profile", {
-        headers: { "Authorization": result.token },
+        headers: { "Authorization": this.token! },
       });
 
       if (!profileResponse.ok) {
@@ -179,7 +178,6 @@ export class BSCAdapter extends BaseAdapter {
         return {
           success: true,
           message: `Successfully logged into ${this.siteName}`,
-          token,
           expiresAt,
         };
       }

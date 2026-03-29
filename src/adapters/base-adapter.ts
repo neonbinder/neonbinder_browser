@@ -10,7 +10,6 @@ export interface AdapterResponse {
   success: boolean;
   message?: string;
   error?: string;
-  token?: string;
   storeName?: string;
   expiresAt?: number;
 }
@@ -50,13 +49,13 @@ abstract login(key: string): Promise<AdapterResponse>;
    * Handles browser and token logic for login. If a valid token is found, sets this.token and returns { token }.
    * Otherwise, launches Puppeteer, sets this.page, and returns { page }.
    */
-  async loginWithBrowser(key: string, page?: Page | null): Promise<{ token?: string; page?: Page }> {
+  async loginWithBrowser(key: string, page?: Page | null): Promise<{ cached: boolean; page?: Page }> {
     const secretsManager = new SecretsManagerService();
     const credentials = await secretsManager.getCredentials(key);
     // If credentials have a non-expired token, use it and return
     if (credentials.token && credentials.expiresAt && credentials.expiresAt > Date.now()) {
       this.token = credentials.token;
-      return { token: credentials.token };
+      return { cached: true };
     }
     // Otherwise, create a browser and page if not provided
     let browser: Browser | null = null;
@@ -77,6 +76,6 @@ abstract login(key: string): Promise<AdapterResponse>;
       throw new Error(`Failed to login to ${this.siteName}: ${loginResult.error}`);
     }
     
-    return { page };
+    return { cached: false, page };
   }
 } 
