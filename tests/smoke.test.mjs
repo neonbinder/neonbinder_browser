@@ -66,6 +66,66 @@ describe("Smoke tests", () => {
     );
   });
 
+  // --- Credential CRUD lifecycle ---
+
+  const SMOKE_KEY = `smoketest-credentials-${Date.now()}`;
+
+  it("PUT /credentials/:key stores credentials", async () => {
+    const res = await fetch(`${BASE_URL}/credentials/${SMOKE_KEY}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", "x-internal-key": API_KEY },
+      body: JSON.stringify({ username: "smoke_user", password: "smoke_pass" }),
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.success, true);
+  });
+
+  it("GET /credentials/:key/metadata returns stored metadata", async () => {
+    const res = await fetch(`${BASE_URL}/credentials/${SMOKE_KEY}/metadata`, {
+      headers: { "x-internal-key": API_KEY },
+    });
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.username, "smoke_user");
+    assert.equal(body.hasToken, false);
+  });
+
+  it("DELETE /credentials/:key removes credentials", async () => {
+    const res = await fetch(`${BASE_URL}/credentials/${SMOKE_KEY}`, {
+      method: "DELETE",
+      headers: { "x-internal-key": API_KEY },
+    });
+    assert.equal(res.status, 200);
+  });
+
+  it("GET /credentials/:key/metadata returns 404 after deletion", async () => {
+    const res = await fetch(`${BASE_URL}/credentials/${SMOKE_KEY}/metadata`, {
+      headers: { "x-internal-key": API_KEY },
+    });
+    assert.equal(res.status, 404);
+  });
+
+  it("PUT /credentials/:key rejects invalid key format", async () => {
+    const res = await fetch(`${BASE_URL}/credentials/INVALID_KEY!!`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", "x-internal-key": API_KEY },
+      body: JSON.stringify({ username: "u", password: "p" }),
+    });
+    assert.equal(res.status, 400);
+  });
+
+  it("credential endpoints reject unauthenticated requests", async () => {
+    const res = await fetch(`${BASE_URL}/credentials/${SMOKE_KEY}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "u", password: "p" }),
+    });
+    assert.equal(res.status, 401);
+  });
+
+  // --- Security headers ---
+
   it("responses include security headers from helmet", async () => {
     const res = await fetch(`${BASE_URL}/health`);
     assert.equal(
