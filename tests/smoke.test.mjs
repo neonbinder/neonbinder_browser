@@ -4,14 +4,17 @@ import assert from "node:assert/strict";
 const BASE_URL = process.env.SMOKE_TEST_URL;
 const API_KEY = process.env.SMOKE_TEST_API_KEY;
 
-if (!BASE_URL || !API_KEY) {
-  console.error(
-    "Required env vars: SMOKE_TEST_URL and SMOKE_TEST_API_KEY must be set"
+const MISSING_ENV = !BASE_URL || !API_KEY;
+
+if (MISSING_ENV) {
+  console.warn(
+    "Skipping smoke tests: SMOKE_TEST_URL and SMOKE_TEST_API_KEY must be set"
   );
-  process.exit(1);
 }
 
-describe("Smoke tests", () => {
+const maybeDescribe = MISSING_ENV ? describe.skip : describe;
+
+maybeDescribe("Smoke tests", () => {
   it("GET /health returns 200 with status ok", async () => {
     const res = await fetch(`${BASE_URL}/health`);
     assert.equal(res.status, 200);

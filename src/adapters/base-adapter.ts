@@ -46,8 +46,9 @@ abstract login(key: string): Promise<AdapterResponse>;
   }
 
   /**
-   * Handles browser and token logic for login. If a valid token is found, sets this.token and returns { token }.
-   * Otherwise, launches Puppeteer, sets this.page, and returns { page }.
+   * Handles browser and token logic for login.
+   * If a valid, non-expired token is found, sets this.token and returns { cached: true }.
+   * Otherwise, launches a Puppeteer page, sets this.page, and returns { cached: false, page }.
    */
   async loginWithBrowser(key: string, page?: Page | null): Promise<{ cached: boolean; page?: Page }> {
     const secretsManager = new SecretsManagerService();

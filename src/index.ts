@@ -223,11 +223,16 @@ app.delete("/credentials/:key", requireInternalAuth, async (req: Request<{ key: 
 
 // Check which keys have credentials
 app.post("/credentials/check", requireInternalAuth, async (req: Request<{}, {}, { keys: string[] }>, res: Response) => {
+  const { keys } = req.body || {};
+  if (!Array.isArray(keys) || keys.some((key) => typeof key !== "string")) {
+    res.status(400).json({ error: "Invalid request body: 'keys' must be an array of strings" });
+    return;
+  }
   try {
     const secretsManager = new SecretsManagerService();
     const results: Record<string, boolean> = {};
     await Promise.all(
-      req.body.keys.map(async (key) => {
+      keys.map(async (key) => {
         results[key] = await secretsManager.credentialsExist(key);
       })
     );

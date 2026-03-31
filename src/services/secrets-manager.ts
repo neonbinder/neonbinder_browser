@@ -111,8 +111,12 @@ export class SecretsManagerService {
     try {
       const [versions] = await this.client.listSecretVersions({ parent: secretName });
       return versions.some(v => v.state === 'ENABLED');
-    } catch {
-      return false;
+    } catch (err: any) {
+      if (err.code === 5 || (err.message && err.message.includes('not found'))) {
+        return false;
+      }
+      console.error(`Failed to check credentials existence for key '${key}':`, err);
+      throw new Error('Failed to check credentials existence');
     }
   }
 
