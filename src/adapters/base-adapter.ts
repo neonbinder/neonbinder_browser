@@ -68,14 +68,7 @@ abstract login(key: string): Promise<AdapterResponse>;
       await page.setViewport({ width: 1920, height: 1080 });
     }
     this.page = page;
-    
-    // Actually perform the login
-    const loginResult = await this.login(key);
-    console.log(`[Base Adapter] Login Result:`, loginResult);
-    if (!loginResult.success) {
-      throw new Error(`Failed to login to ${this.siteName}: ${loginResult.error}`);
-    }
-    
+
     return { cached: false, page };
   }
 } 
