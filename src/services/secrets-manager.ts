@@ -59,7 +59,7 @@ export class SecretsManagerService {
         expiresAt: credentials.expiresAt
       };
     } catch (error: any) {
-      console.error(`Failed to retrieve credentials for key '${key}':`, error);
+      console.error("Failed to retrieve credentials for key '%s':", key, error);
       if (error.code === 5 || (error.message && error.message.includes('not found'))) {
         throw new Error(`Credentials not found for key: ${key}`);
       }
@@ -100,7 +100,7 @@ export class SecretsManagerService {
       if (err.code === 5 || (err.message && err.message.includes('not found'))) {
         return;
       }
-      console.error(`Failed to delete credentials for key '${key}':`, err);
+      console.error("Failed to delete credentials for key '%s':", key, err);
       throw new Error(`Failed to delete credentials`);
     }
   }
@@ -115,7 +115,7 @@ export class SecretsManagerService {
       if (err.code === 5 || (err.message && err.message.includes('not found'))) {
         return false;
       }
-      console.error(`Failed to check credentials existence for key '${key}':`, err);
+      console.error("Failed to check credentials existence for key '%s':", key, err);
       throw new Error('Failed to check credentials existence');
     }
   }
@@ -149,7 +149,7 @@ export class SecretsManagerService {
           payload: { data: Buffer.from(payload, 'utf8') },
         });
       } else {
-        console.error(`Failed to update credentials for key '${key}':`, err);
+        console.error("Failed to update credentials for key '%s':", key, err);
         throw new Error(`Failed to update credentials`);
       }
     }

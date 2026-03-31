@@ -116,7 +116,7 @@ describe("BSCAdapter.login", () => {
     });
 
     const restore = stubFetch(async (url, _opts) => {
-      assert.ok(url.includes("buysportscards.com"), "should hit BSC profile API");
+      assert.equal(new URL(url).hostname, "api-prod.buysportscards.com", "should hit BSC profile API");
       return {
         ok: true,
         status: 200,
