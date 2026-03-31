@@ -35,6 +35,9 @@ COPY package*.json ./
 # Install all dependencies (including dev dependencies for build)
 RUN npm ci
 
+# Install Chrome for Puppeteer (before pruning dev deps)
+RUN npx puppeteer browsers install chrome
+
 # Copy source code
 COPY . .
 
@@ -47,7 +50,9 @@ RUN rm -rf src/ tsconfig.json
 
 # Create non-root user for running Puppeteer
 RUN groupadd -r pptruser && useradd -r -g pptruser -G audio,video pptruser \
-    && mkdir -p /home/pptruser && chown -R pptruser:pptruser /home/pptruser /app
+    && mkdir -p /home/pptruser/.cache && chown -R pptruser:pptruser /home/pptruser /app /root/.cache/puppeteer
+# Move Chrome cache to pptruser's home so it's accessible at runtime
+RUN cp -r /root/.cache/puppeteer /home/pptruser/.cache/puppeteer && chown -R pptruser:pptruser /home/pptruser/.cache
 
 USER pptruser
 
