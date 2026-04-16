@@ -34,7 +34,7 @@ jobs:
             echo "GCP_PROJECT=neonbinder" >> $GITHUB_ENV
           else
             echo "ENV_NAME=dev" >> $GITHUB_ENV
-            echo "GCP_PROJECT=neonbinder-dev-io" >> $GITHUB_ENV
+            echo "GCP_PROJECT=neonbinder-dev" >> $GITHUB_ENV
           fi
 
       - id: auth
@@ -79,11 +79,9 @@ jobs:
           if [ "${{ github.ref_name }}" = "main" ]; then
             echo "ENV_NAME=prod" >> $GITHUB_ENV
             echo "GCP_PROJECT=neonbinder" >> $GITHUB_ENV
-            echo "SMOKE_TEST_URL=https://neonbinder-browser-5pwyyc5gzq-uc.a.run.app" >> $GITHUB_ENV
           else
             echo "ENV_NAME=dev" >> $GITHUB_ENV
-            echo "GCP_PROJECT=neonbinder-dev-io" >> $GITHUB_ENV
-            echo "SMOKE_TEST_URL=https://neonbinder-browser-jjwqo53dra-uc.a.run.app" >> $GITHUB_ENV
+            echo "GCP_PROJECT=neonbinder-dev" >> $GITHUB_ENV
           fi
 
       - id: auth
@@ -93,6 +91,11 @@ jobs:
           service_account: ${{ env.ENV_NAME == 'prod' && secrets.GCP_SERVICE_ACCOUNT_DEPLOYER || secrets.GCP_SERVICE_ACCOUNT_DEPLOYER_DEV }}
 
       - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Resolve Cloud Run URL
+        run: |
+          SMOKE_URL=$(gcloud run services describe neonbinder-browser --project=${{ env.GCP_PROJECT }} --region=us-central1 --format='value(status.url)')
+          echo "SMOKE_TEST_URL=$SMOKE_URL" >> $GITHUB_ENV
 
       - name: Fetch API key from Secret Manager
         run: |

@@ -21,7 +21,7 @@ export class SecretsManagerService {
 
   constructor() {
     this.client = new SecretManagerServiceClient();
-    this.projectId = process.env.GOOGLE_CLOUD_PROJECT || 'neonbinder-484017';
+    this.projectId = process.env.GOOGLE_CLOUD_PROJECT || 'neonbinder';
   }
   async getCredentials(key: string): Promise<Credentials> {
     validateKeyFormat(key);
