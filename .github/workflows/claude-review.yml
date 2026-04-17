@@ -16,6 +16,7 @@ permissions:
   contents: read
   pull-requests: write
   issues: write
+  id-token: write
 
 jobs:
   claude-review:
@@ -29,6 +30,5 @@ jobs:
 
       - uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           prompt: "Review this pull request for code quality, correctness, security vulnerabilities (OWASP Top 10), and adherence to project conventions in CLAUDE.md. Focus on: (1) credential/secret handling — this service talks to Secret Manager, (2) Puppeteer/Chrome safety, (3) Convex integration via NEONBINDER_BROWSER_URL, (4) error handling and auth middleware. Post findings as inline review comments on the PR. Be specific about file:line."
           claude_args: "--max-turns 5"
