@@ -1,6 +1,17 @@
 import { BaseAdapter, AdapterResponse } from "./base-adapter";
 import { SecretsManagerService } from "../services/secrets-manager";
 
+// Retry budget for transient SportLots failures.
+// Backoffs apply BETWEEN attempts: 1→2, 2→3, 3→4, 4→5.
+// Total max added sleep ≈ 7.5s; well inside Cloud Run's default timeout.
+const MAX_ATTEMPTS = 5;
+const BACKOFFS_MS = [500, 1000, 2000, 4000];
+
+function sleepWithJitter(baseMs: number): Promise<void> {
+  const jitter = baseMs * (Math.random() * 0.6 - 0.3); // ±30%
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, baseMs + jitter)));
+}
+
 export class SportlotsAdapter extends BaseAdapter {
   constructor(page: any) {
     super(page, "Sportlots");
@@ -12,13 +23,35 @@ export class SportlotsAdapter extends BaseAdapter {
 
   /**
    * Login to SportLots via HTTP POST, extract JS-set cookies from response body.
-   * All scraping now happens via direct HTTP in the Convex adapter — this method
-   * only handles credential validation and cookie extraction.
+   * Retries up to MAX_ATTEMPTS on transient failures (429, 5xx, network error,
+   * empty cookie body); returns immediately on permanent failures (4xx non-429,
+   * invalid credentials, validation seeing a login page).
    */
   async login(key: string): Promise<AdapterResponse> {
+    let last: AdapterResponse = { success: false, error: "Login did not run" };
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      if (attempt > 1) {
+        console.log(
+          `[SportLots Adapter] retry attempt ${attempt}/${MAX_ATTEMPTS} — previous error: ${last.error}`,
+        );
+      }
+      last = await this.attemptLogin(key, attempt);
+      if (last.success) return last;
+      if (!last.retryable || attempt === MAX_ATTEMPTS) return last;
+      await sleepWithJitter(BACKOFFS_MS[attempt - 1]);
+    }
+    return last;
+  }
+
+  /**
+   * Single login attempt. Sets `retryable: true` on error branches we want the
+   * outer loop to retry (transient upstream issues, empty body); leaves it
+   * undefined on permanent errors so the caller bails immediately.
+   */
+  private async attemptLogin(key: string, attempt: number): Promise<AdapterResponse> {
     const t0 = Date.now();
     const log = (msg: string) =>
-      console.log(`[SportLots Adapter] ${msg} (t+${Date.now() - t0}ms)`);
+      console.log(`[SportLots Adapter] ${msg} (t+${Date.now() - t0}ms, attempt ${attempt}/${MAX_ATTEMPTS})`);
     try {
       log("login start");
       const secretsManager = new SecretsManagerService();
@@ -49,15 +82,26 @@ export class SportlotsAdapter extends BaseAdapter {
       // Check for upstream failures before parsing cookies
       if (response.status === 429) {
         log("login rejected: 429 rate limit");
-        return { success: false, error: "SportLots rate limit exceeded. Please try again later." };
+        return {
+          success: false,
+          error: "SportLots rate limit exceeded. Please try again later.",
+          retryable: true,
+        };
       }
       if (response.status >= 500) {
         log(`login rejected: upstream ${response.status}`);
-        return { success: false, error: `SportLots is unavailable (HTTP ${response.status}). Please try again later.` };
+        return {
+          success: false,
+          error: `SportLots is unavailable (HTTP ${response.status}). Please try again later.`,
+          retryable: true,
+        };
       }
       if (response.status >= 400) {
         log(`login rejected: upstream ${response.status}`);
-        return { success: false, error: `SportLots returned an error (HTTP ${response.status}).` };
+        return {
+          success: false,
+          error: `SportLots returned an error (HTTP ${response.status}).`,
+        };
       }
 
       const responseBody = await response.text();
@@ -77,13 +121,15 @@ export class SportlotsAdapter extends BaseAdapter {
       log(`parsed ${cookies.length} cookie(s) from body`);
 
       if (cookies.length === 0) {
-        // Include a hint from the body so we can see whether SL changed
-        // the cookie-set shape or returned an unexpected page.
+        // Most often a blank/slow body from SL; retry once. If SL genuinely
+        // changed their response format we'll see it in the preview over
+        // multiple retries.
         const preview = responseBody.slice(0, 200).replace(/\s+/g, " ");
         log(`no cookies parsed; body preview: ${preview}`);
         return {
           success: false,
           error: "No session cookies received. Check credentials.",
+          retryable: true,
         };
       }
 
@@ -127,6 +173,7 @@ export class SportlotsAdapter extends BaseAdapter {
       return {
         success: false,
         error: `Failed to login to ${this.siteName}: ${error}`,
+        retryable: true,
       };
     }
   }
