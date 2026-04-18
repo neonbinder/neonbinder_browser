@@ -23,18 +23,26 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    outputs:
+      # Captured BEFORE the new revision is deployed so the post-deploy E2E
+      # job can roll traffic back to it if validation fails.
+      prev_revision: ${{ steps.capture-prev.outputs.prev_revision }}
+      gcp_project: ${{ steps.env.outputs.gcp_project }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set environment
+      - id: env
+        name: Set environment
         run: |
           if [ "${{ github.ref_name }}" = "main" ]; then
             echo "ENV_NAME=prod" >> $GITHUB_ENV
             echo "GCP_PROJECT=neonbinder" >> $GITHUB_ENV
+            echo "gcp_project=neonbinder" >> $GITHUB_OUTPUT
           else
             echo "ENV_NAME=dev" >> $GITHUB_ENV
             echo "GCP_PROJECT=neonbinder-dev" >> $GITHUB_ENV
+            echo "gcp_project=neonbinder-dev" >> $GITHUB_OUTPUT
           fi
 
       - id: auth
@@ -44,6 +52,28 @@ jobs:
           service_account: ${{ env.ENV_NAME == 'prod' && secrets.GCP_SERVICE_ACCOUNT_DEPLOYER || secrets.GCP_SERVICE_ACCOUNT_DEPLOYER_DEV }}
 
       - uses: google-github-actions/setup-gcloud@v2
+
+      - id: capture-prev
+        name: Capture previous serving revision
+        run: |
+          # Grab the revision that currently holds 100% of traffic so the
+          # post-deploy job can shift traffic back to it on E2E failure.
+          # If the service doesn't exist yet (first deploy ever), leave
+          # prev_revision empty and skip rollback later.
+          if gcloud run services describe neonbinder-browser \
+               --region=us-central1 \
+               --project="$GCP_PROJECT" \
+               --format='value(name)' > /dev/null 2>&1; then
+            PREV=$(gcloud run services describe neonbinder-browser \
+              --region=us-central1 \
+              --project="$GCP_PROJECT" \
+              --format='value(status.traffic[0].revisionName)')
+            echo "Previous serving revision: $PREV"
+            echo "prev_revision=$PREV" >> $GITHUB_OUTPUT
+          else
+            echo "No existing service; skipping prev_revision capture (first-time deploy)."
+            echo "prev_revision=" >> $GITHUB_OUTPUT
+          fi
 
       - name: Configure Docker for GCR
         run: gcloud auth configure-docker --quiet
@@ -107,3 +137,148 @@ jobs:
 
       - name: Run smoke tests
         run: node --test tests/smoke.test.mjs
+
+  # After smoke passes, dispatch the neonbinder_convex E2E suite against the
+  # `integration-test` branch (a permanent mirror of main whose Vercel preview
+  # points at dev Convex). If E2E fails, the `rollback` job that follows
+  # shifts Cloud Run traffic back to the previous revision.
+  #
+  # Dev-only for now — prod deploys (main) don't dispatch here because there's
+  # no equivalent prod-facing E2E setup yet.
+  e2e-validate:
+    needs: [deploy, smoke-test]
+    if: github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      e2e_run_id: ${{ steps.dispatch.outputs.run_id }}
+      e2e_run_url: ${{ steps.dispatch.outputs.run_url }}
+
+    steps:
+      - id: dispatch
+        name: Dispatch neonbinder_convex E2E on integration-test
+        env:
+          GH_TOKEN: ${{ secrets.CONVEX_E2E_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Record a "created_at >= this" watermark before dispatching so we
+          # pick up the exact run we just triggered, not one that may have
+          # already been in flight.
+          BEFORE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          echo "Dispatching E2E on neonbinder_convex@integration-test..."
+          gh workflow run e2e-tests.yml \
+            --repo neonbinder/neonbinder_convex \
+            --ref integration-test
+
+          # Poll until the new run appears (GitHub needs a few seconds).
+          for attempt in $(seq 1 20); do
+            RUN_ID=$(gh run list \
+              --repo neonbinder/neonbinder_convex \
+              --workflow=e2e-tests.yml \
+              --branch integration-test \
+              --limit 5 \
+              --json databaseId,createdAt \
+              --jq "[.[] | select(.createdAt >= \"$BEFORE\")] | sort_by(.createdAt) | .[0].databaseId // empty")
+            if [ -n "$RUN_ID" ]; then break; fi
+            echo "attempt $attempt/20: run not yet visible, waiting 3s"
+            sleep 3
+          done
+          if [ -z "$RUN_ID" ]; then
+            echo "Failed to locate dispatched run after 1 minute."
+            exit 1
+          fi
+
+          RUN_URL="https://github.com/neonbinder/neonbinder_convex/actions/runs/$RUN_ID"
+          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+          echo "run_url=$RUN_URL" >> $GITHUB_OUTPUT
+          echo "Dispatched run: $RUN_URL"
+
+      - name: Wait for E2E completion
+        env:
+          GH_TOKEN: ${{ secrets.CONVEX_E2E_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          RUN_ID=${{ steps.dispatch.outputs.run_id }}
+          # Poll every 30s for up to 45 minutes. The full Maestro suite
+          # takes ~20-25 minutes plus Vercel + Maestro install overhead.
+          for attempt in $(seq 1 90); do
+            STATE=$(gh run view "$RUN_ID" \
+              --repo neonbinder/neonbinder_convex \
+              --json status,conclusion \
+              --jq '"\(.status)|\(.conclusion)"')
+            STATUS="${STATE%%|*}"
+            CONCLUSION="${STATE##*|}"
+            if [ "$STATUS" = "completed" ]; then
+              echo "E2E completed with conclusion: $CONCLUSION"
+              if [ "$CONCLUSION" = "success" ]; then
+                exit 0
+              fi
+              exit 1
+            fi
+            echo "attempt $attempt/90: $STATUS — waiting 30s"
+            sleep 30
+          done
+          echo "Timed out after 45 minutes waiting for E2E."
+          exit 1
+
+  rollback:
+    needs: [deploy, e2e-validate]
+    if: always() && needs.e2e-validate.result == 'failure' && needs.deploy.outputs.prev_revision != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER_DEV }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_DEPLOYER_DEV }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Roll Cloud Run traffic back to ${{ needs.deploy.outputs.prev_revision }}
+        run: |
+          set -euo pipefail
+          PREV="${{ needs.deploy.outputs.prev_revision }}"
+          PROJECT="${{ needs.deploy.outputs.gcp_project }}"
+          echo "Shifting 100% of traffic on neonbinder-browser back to $PREV"
+          gcloud run services update-traffic neonbinder-browser \
+            --region=us-central1 \
+            --project="$PROJECT" \
+            --to-revisions="$PREV=100"
+          echo "Rollback complete. The broken revision stays in the revision"
+          echo "list (inactive) so we can inspect it, but serves no traffic."
+
+  report-rollback:
+    needs: [deploy, e2e-validate, rollback]
+    if: always() && needs.rollback.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - name: Open GitHub issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # No --label flag so the command doesn't fail if the repo is
+          # missing the referenced labels; issue title is distinctive enough
+          # for manual filtering/triage.
+          gh issue create \
+            --repo neonbinder/neonbinder_browser \
+            --title "Auto-rollback: dev deploy ${{ github.sha }} failed E2E" \
+            --body "$(cat <<EOF
+          A develop deploy was auto-rolled-back after the neonbinder_convex E2E suite failed.
+
+          **SHA that rolled back:** ${{ github.sha }}
+          **Rolled back to:** \`${{ needs.deploy.outputs.prev_revision }}\`
+          **E2E run:** ${{ needs.e2e-validate.outputs.e2e_run_url }}
+          **Deploy run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          The broken revision is still in Cloud Run's revision list (serving 0% traffic) for inspection. Investigate the failing E2E flows, fix forward in a new PR, and delete this issue when green again.
+          EOF
+          )"
