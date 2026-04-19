@@ -375,6 +375,10 @@ jobs:
   # This is the signal the dev gate cannot produce: can the prod browser
   # service, with its prod env + prod Secret Manager + prod service account,
   # actually authenticate to SportLots and BSC?
+  #
+  # Uses the `tests/integration/` suite — adding a new marketplace capability
+  # (bulk upload, inventory sync, etc.) is a new `tests/integration/*.test.mjs`
+  # file. No workflow edit needed.
   login-probe:
     needs: [deploy, smoke-test]
     if: github.ref == 'refs/heads/main'
@@ -384,6 +388,12 @@ jobs:
       id-token: write
 
     steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
       - uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
@@ -395,19 +405,15 @@ jobs:
         run: |
           echo "INTERNAL_API_KEY=$(gcloud secrets versions access latest --secret=internal-api-key --project=neonbinder)" >> $GITHUB_ENV
 
-      - name: Probe /login/bsc
+      - name: Run prod-gate integration suite
         env:
-          TAGGED_URL: ${{ needs.deploy.outputs.tagged_url }}
+          TARGET_URL: ${{ needs.deploy.outputs.tagged_url }}
+          # INTERNAL_API_KEY is already in $GITHUB_ENV from the previous step.
           BSC_USERNAME: ${{ secrets.MAESTRO_BSC_USERNAME }}
           BSC_PASSWORD: ${{ secrets.MAESTRO_BSC_PASSWORD }}
-        run: ./scripts/login-probe.sh buysportscards "$BSC_USERNAME" "$BSC_PASSWORD" bsc
-
-      - name: Probe /login/sportlots
-        env:
-          TAGGED_URL: ${{ needs.deploy.outputs.tagged_url }}
           SPORTLOTS_USERNAME: ${{ secrets.MAESTRO_SPORTLOTS_USERNAME }}
           SPORTLOTS_PASSWORD: ${{ secrets.MAESTRO_SPORTLOTS_PASSWORD }}
-        run: ./scripts/login-probe.sh sportlots "$SPORTLOTS_USERNAME" "$SPORTLOTS_PASSWORD" sportlots
+        run: npm run test:prod-gate
 
   # Only runs if the tagged revision passed both smoke + login-probe. Shifts
   # 100% traffic to it. On any prior failure, this job is skipped and the
