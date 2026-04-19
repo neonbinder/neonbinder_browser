@@ -10,7 +10,8 @@
     "dev:login": "gcloud auth application-default login --impersonate-service-account=neonbinder-browser-runtime@neonbinder-dev-io.iam.gserviceaccount.com",
     "deploy": "gcloud builds submit --config cloudbuild.yaml .",
     "test": "node --test tests/base-adapter.test.mjs tests/bsc-adapter.test.mjs tests/sportlots-adapter.test.mjs tests/credentials-routes.test.mjs",
-    "test:smoke": "node --test tests/smoke.test.mjs"
+    "test:smoke": "node --test tests/smoke.test.mjs",
+    "test:prod-gate": "node --test tests/integration/*.test.mjs"
   },
   "keywords": [],
   "author": "",
