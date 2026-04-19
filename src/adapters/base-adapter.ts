@@ -12,6 +12,12 @@ export interface AdapterResponse {
   error?: string;
   storeName?: string;
   expiresAt?: number;
+  /**
+   * Set by adapters on `success: false` to indicate whether the caller
+   * should retry. Used internally by the adapter's own retry loop; not
+   * exposed in the HTTP response.
+   */
+  retryable?: boolean;
 }
 
 export abstract class BaseAdapter {
