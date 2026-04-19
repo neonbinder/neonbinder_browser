@@ -3,9 +3,15 @@ name: Deploy Browser Service
 on:
   push:
     branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
   workflow_dispatch:
 
 jobs:
+  # Unit tests + build run on both push and pull_request so a PR surfaces
+  # any breakage before merge. All deploy/gate jobs below are gated on
+  # `github.event_name == 'push'` — they need an actual ref to deploy, and
+  # we never want a PR to push a Cloud Run revision.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -19,6 +25,7 @@ jobs:
 
   deploy:
     needs: test
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -161,6 +168,7 @@ jobs:
 
   smoke-test:
     needs: deploy
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: read
