@@ -46,10 +46,15 @@ function authHeaders() {
  * marketplace (`bsc`, `sportlots`), `GITHUB_SHA` provides uniqueness when
  * running in CI; falls back to a timestamp locally so concurrent dev runs
  * don't collide.
+ *
+ * Key format matches `src/services/secrets-manager.ts`'s
+ * KEY_PATTERN = /^[a-z0-9]+-credentials-[a-zA-Z0-9_-]+$/ — the literal
+ * "-credentials-" segment is required or PUT /credentials/:key returns
+ * HTTP 400 "Invalid credential key format".
  */
 export function probeKey(slug) {
   const sha = (process.env.GITHUB_SHA || String(Date.now())).slice(0, 7);
-  return `probe-${slug}-${sha}`;
+  return `${slug}-credentials-probe-${sha}`;
 }
 
 export async function putCredentials(key, { username, password }) {
