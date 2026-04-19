@@ -25,9 +25,15 @@ jobs:
       id-token: write
     outputs:
       # Captured BEFORE the new revision is deployed so the post-deploy E2E
-      # job can roll traffic back to it if validation fails.
+      # job can roll traffic back to it if validation fails (develop path).
       prev_revision: ${{ steps.capture-prev.outputs.prev_revision }}
       gcp_project: ${{ steps.env.outputs.gcp_project }}
+      # Prod-only (main path): the blue/green deploy lands with 0% traffic
+      # under a sha-based tag so the prod gate can validate the exact new
+      # revision before we shift traffic to it.
+      new_revision: ${{ steps.capture-new.outputs.new_revision }}
+      tagged_url: ${{ steps.capture-new.outputs.tagged_url }}
+      deploy_tag: ${{ steps.compute-tag.outputs.deploy_tag }}
 
     steps:
       - uses: actions/checkout@v4
@@ -45,6 +51,18 @@ jobs:
             echo "gcp_project=neonbinder-dev" >> $GITHUB_OUTPUT
           fi
 
+      - id: compute-tag
+        name: Compute Cloud Run tag
+        # Prod uses a blue/green flow: deploy with a sha-derived tag and
+        # no_traffic so the gate can exercise the new revision before it
+        # serves users. Dev doesn't need a tag — the dev-path jobs already
+        # test against the default service URL.
+        run: |
+          SHORT="$(echo "$GITHUB_SHA" | cut -c1-7)"
+          TAG="sha-$SHORT"
+          echo "deploy_tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Deploy tag: $TAG"
+
       - id: auth
         uses: google-github-actions/auth@v2
         with:
@@ -56,10 +74,12 @@ jobs:
       - id: capture-prev
         name: Capture previous serving revision
         run: |
-          # Grab the revision that currently holds 100% of traffic so the
-          # post-deploy job can shift traffic back to it on E2E failure.
-          # If the service doesn't exist yet (first deploy ever), leave
-          # prev_revision empty and skip rollback later.
+          # Grab the revision that currently holds 100% of traffic so
+          # post-deploy jobs can roll back to it if validation fails. Dev
+          # uses this for `gcloud run services update-traffic`; prod's
+          # blue/green flow doesn't need to roll anything (the new revision
+          # is parked at 0% traffic), but we capture it for the failure
+          # issue message so it's clear which revision is still serving.
           if gcloud run services describe neonbinder-browser \
                --region=us-central1 \
                --project="$GCP_PROJECT" \
@@ -86,13 +106,58 @@ jobs:
             .
           docker push gcr.io/${{ env.GCP_PROJECT }}/neonbinder-browser --all-tags
 
-      - uses: google-github-actions/deploy-cloudrun@v2
+      - name: Deploy to Cloud Run (prod, tagged no-traffic)
+        if: github.ref == 'refs/heads/main'
+        uses: google-github-actions/deploy-cloudrun@v2
         with:
           service: neonbinder-browser
           region: us-central1
           image: gcr.io/${{ env.GCP_PROJECT }}/neonbinder-browser:${{ github.sha }}
           project_id: ${{ env.GCP_PROJECT }}
           env_vars: ENVIRONMENT=${{ env.ENV_NAME }}
+          no_traffic: true
+          tag: ${{ steps.compute-tag.outputs.deploy_tag }}
+
+      - name: Deploy to Cloud Run (dev, immediate traffic)
+        if: github.ref != 'refs/heads/main'
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: neonbinder-browser
+          region: us-central1
+          image: gcr.io/${{ env.GCP_PROJECT }}/neonbinder-browser:${{ github.sha }}
+          project_id: ${{ env.GCP_PROJECT }}
+          env_vars: ENVIRONMENT=${{ env.ENV_NAME }}
+
+      - id: capture-new
+        name: Capture new revision name + tagged URL (prod only)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.compute-tag.outputs.deploy_tag }}"
+          # latestCreatedRevisionName is the revision the deploy action just
+          # produced. In the no_traffic + tag flow it's also the one bound
+          # to the tag.
+          NEW=$(gcloud run services describe neonbinder-browser \
+            --region=us-central1 \
+            --project="$GCP_PROJECT" \
+            --format='value(status.latestCreatedRevisionName)')
+          # The tagged URL follows the Cloud Run pattern
+          # https://<tag>---<service>-<hash>.run.app; we extract it from
+          # the traffic list rather than constructing it, in case Google
+          # changes the format.
+          TAGGED_URL=$(gcloud run services describe neonbinder-browser \
+            --region=us-central1 \
+            --project="$GCP_PROJECT" \
+            --format=json \
+            | jq -r ".status.traffic[] | select(.tag == \"$TAG\") | .url")
+          if [ -z "$TAGGED_URL" ] || [ "$TAGGED_URL" = "null" ]; then
+            echo "ERROR: tagged URL for tag=$TAG not found on service."
+            exit 1
+          fi
+          echo "new_revision=$NEW" >> $GITHUB_OUTPUT
+          echo "tagged_url=$TAGGED_URL" >> $GITHUB_OUTPUT
+          echo "New revision: $NEW"
+          echo "Tagged URL: $TAGGED_URL"
 
   smoke-test:
     needs: deploy
@@ -122,10 +187,18 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
-      - name: Resolve Cloud Run URL
+      - name: Resolve target URL
         run: |
-          SMOKE_URL=$(gcloud run services describe neonbinder-browser --project=${{ env.GCP_PROJECT }} --region=us-central1 --format='value(status.url)')
+          # Prod exercises the tagged (no-traffic) revision so smoke runs
+          # against the thing we're about to promote. Dev exercises the
+          # live service URL since the new revision already holds 100%.
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            SMOKE_URL="${{ needs.deploy.outputs.tagged_url }}"
+          else
+            SMOKE_URL=$(gcloud run services describe neonbinder-browser --project=${{ env.GCP_PROJECT }} --region=us-central1 --format='value(status.url)')
+          fi
           echo "SMOKE_TEST_URL=$SMOKE_URL" >> $GITHUB_ENV
+          echo "Smoke target: $SMOKE_URL"
 
       - name: Fetch API key from Secret Manager
         run: |
@@ -138,13 +211,14 @@ jobs:
       - name: Run smoke tests
         run: node --test tests/smoke.test.mjs
 
+  # ---------------------------------------------------------------------------
+  # Dev path: post-deploy Maestro E2E + auto-rollback via update-traffic.
+  # ---------------------------------------------------------------------------
+
   # After smoke passes, dispatch the neonbinder_convex E2E suite against the
   # `integration-test` branch (a permanent mirror of main whose Vercel preview
   # points at dev Convex). If E2E fails, the `rollback` job that follows
   # shifts Cloud Run traffic back to the previous revision.
-  #
-  # Dev-only for now — prod deploys (main) don't dispatch here because there's
-  # no equivalent prod-facing E2E setup yet.
   e2e-validate:
     needs: [deploy, smoke-test]
     if: github.ref == 'refs/heads/develop'
@@ -280,5 +354,131 @@ jobs:
           **Deploy run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
           The broken revision is still in Cloud Run's revision list (serving 0% traffic) for inspection. Investigate the failing E2E flows, fix forward in a new PR, and delete this issue when green again.
+          EOF
+          )"
+
+  # ---------------------------------------------------------------------------
+  # Prod path: blue/green — tagged no-traffic deploy, gate with smoke + login
+  # probes, then promote to 100% traffic. A failure at any step leaves the new
+  # revision parked at 0% traffic and prod still serving the previous revision.
+  # ---------------------------------------------------------------------------
+
+  # Exercise the real marketplace login path against the tagged revision.
+  # This is the signal the dev gate cannot produce: can the prod browser
+  # service, with its prod env + prod Secret Manager + prod service account,
+  # actually authenticate to SportLots and BSC?
+  login-probe:
+    needs: [deploy, smoke-test]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_DEPLOYER }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Fetch internal API key
+        run: |
+          echo "INTERNAL_API_KEY=$(gcloud secrets versions access latest --secret=internal-api-key --project=neonbinder)" >> $GITHUB_ENV
+
+      - name: Probe /login/bsc
+        env:
+          TAGGED_URL: ${{ needs.deploy.outputs.tagged_url }}
+          BSC_USERNAME: ${{ secrets.MAESTRO_BSC_USERNAME }}
+          BSC_PASSWORD: ${{ secrets.MAESTRO_BSC_PASSWORD }}
+        run: ./scripts/login-probe.sh buysportscards "$BSC_USERNAME" "$BSC_PASSWORD" bsc
+
+      - name: Probe /login/sportlots
+        env:
+          TAGGED_URL: ${{ needs.deploy.outputs.tagged_url }}
+          SPORTLOTS_USERNAME: ${{ secrets.MAESTRO_SPORTLOTS_USERNAME }}
+          SPORTLOTS_PASSWORD: ${{ secrets.MAESTRO_SPORTLOTS_PASSWORD }}
+        run: ./scripts/login-probe.sh sportlots "$SPORTLOTS_USERNAME" "$SPORTLOTS_PASSWORD" sportlots
+
+  # Only runs if the tagged revision passed both smoke + login-probe. Shifts
+  # 100% traffic to it. On any prior failure, this job is skipped and the
+  # previous revision continues to serve.
+  promote:
+    needs: [deploy, smoke-test, login-probe]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_DEPLOYER }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Shift 100% traffic to ${{ needs.deploy.outputs.new_revision }}
+        run: |
+          set -euo pipefail
+          NEW="${{ needs.deploy.outputs.new_revision }}"
+          echo "Promoting $NEW to 100% traffic"
+          gcloud run services update-traffic neonbinder-browser \
+            --region=us-central1 \
+            --project=neonbinder \
+            --to-revisions="$NEW=100"
+          echo "Promotion complete. The tag ($TAG) remains on the revision"
+          echo "for later inspection."
+        env:
+          TAG: ${{ needs.deploy.outputs.deploy_tag }}
+
+  # Opens an issue on any prod-gate failure so the team sees it. The new
+  # revision stays at 0% traffic (tagged); prod still serves the previous.
+  report-prod-gate-failure:
+    needs: [deploy, smoke-test, login-probe, promote]
+    if: always() && github.ref == 'refs/heads/main' && (needs.deploy.result == 'failure' || needs.smoke-test.result == 'failure' || needs.login-probe.result == 'failure' || needs.promote.result == 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - name: Open GitHub issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FAILED_DEPLOY: ${{ needs.deploy.result }}
+          FAILED_SMOKE: ${{ needs.smoke-test.result }}
+          FAILED_PROBE: ${{ needs.login-probe.result }}
+          FAILED_PROMOTE: ${{ needs.promote.result }}
+        run: |
+          # Identify which stage failed for the issue title. Stop at the
+          # first failure — later stages are skipped on prior failure.
+          if [ "$FAILED_DEPLOY" = "failure" ]; then STAGE=deploy
+          elif [ "$FAILED_SMOKE" = "failure" ]; then STAGE=smoke-test
+          elif [ "$FAILED_PROBE" = "failure" ]; then STAGE=login-probe
+          elif [ "$FAILED_PROMOTE" = "failure" ]; then STAGE=promote
+          else STAGE=unknown
+          fi
+
+          gh issue create \
+            --repo neonbinder/neonbinder_browser \
+            --title "Prod gate failed at ${STAGE}: ${{ github.sha }}" \
+            --body "$(cat <<EOF
+          Prod gate failed at **\`${STAGE}\`**. The new revision is parked at 0% traffic; production is unaffected — it's still serving the previous revision.
+
+          **SHA:** ${{ github.sha }}
+          **New (parked) revision:** \`${{ needs.deploy.outputs.new_revision }}\`
+          **Tag:** \`${{ needs.deploy.outputs.deploy_tag }}\`
+          **Tagged URL (for local poking):** ${{ needs.deploy.outputs.tagged_url }}
+          **Still-serving revision:** \`${{ needs.deploy.outputs.prev_revision }}\`
+          **Deploy run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          Next steps:
+          1. Look at the failed stage's logs to diagnose.
+          2. Fix forward in a new PR (rollback is already "in effect" — nothing to undo).
+          3. Optionally delete the parked revision via \`gcloud run revisions delete ${{ needs.deploy.outputs.new_revision }} --region=us-central1 --project=neonbinder\` once you're confident it's not needed for inspection.
+          4. Close this issue when a subsequent green deploy lands.
           EOF
           )"
