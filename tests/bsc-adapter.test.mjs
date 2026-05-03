@@ -396,3 +396,233 @@ describe("BSCAdapter.login — fresh-login path (no cached token)", () => {
     assert.ok(result.error, "should include an error message");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Cleanup invariant
+// ---------------------------------------------------------------------------
+//
+// Every successful launchPage() must be paired with a cleanup() call so the
+// underlying Chromium child process is killed. Without this, ~150-200 MiB
+// leaks per request and Cloud Run OOM-kills the container after ~10 logins
+// on the same instance. The 2026-05-03 dev-Cloud-Run OOM ("Memory limit of
+// 2048 MiB exceeded with 2069 MiB used") was caused by this exact leak.
+// These tests pin the invariant in code so a future refactor can't silently
+// re-introduce the regression.
+
+/**
+ * Build an instrumented browser whose close() call is observable. Each test
+ * passes its own counter object so it can assert how many times close was
+ * invoked across the adapter's lifetime.
+ */
+function makeInstrumentedBrowser(counter, pageOverride) {
+  return {
+    newPage: async () => pageOverride ?? defaultMockPage,
+    close: async () => {
+      counter.calls++;
+    },
+  };
+}
+
+describe("BSCAdapter.cleanup — Chromium process lifecycle", () => {
+  it("closes the launched browser exactly once after a successful fresh login", async () => {
+    const counter = { calls: 0 };
+    patchPuppeteer(async () => makeInstrumentedBrowser(counter));
+
+    const BSCAdapter = loadBSCAdapter({
+      credentials: { username: "seller@example.com", password: "secret" },
+      updateCredentials: null,
+    });
+
+    const adapter = new BSCAdapter(undefined);
+    const result = await adapter.login("bsc-credentials-seller1");
+    await adapter.cleanup();
+
+    patchPuppeteer();
+
+    assert.equal(result.success, true, "fresh login should succeed");
+    assert.equal(counter.calls, 1, "browser.close() must run exactly once after a successful login");
+  });
+
+  it("still closes the launched browser when the login flow throws inside Puppeteer", async () => {
+    const counter = { calls: 0 };
+    // Page where every locator interaction throws — drives the adapter into
+    // its catch block. The Browser was still launched, so cleanup must close
+    // it; otherwise a single bad selector during a real flow leaks a
+    // Chromium process.
+    const throwingPage = makeMockPage({
+      locator: () => ({
+        filter: () => ({ click: async () => { throw new Error("Sign In not found"); } }),
+        click: async () => { throw new Error("Sign In not found"); },
+        setTimeout: () => ({ click: async () => { throw new Error("Sign In not found"); } }),
+      }),
+    });
+    patchPuppeteer(async () => makeInstrumentedBrowser(counter, throwingPage));
+
+    const BSCAdapter = loadBSCAdapter({
+      credentials: { username: "seller@example.com", password: "secret" },
+      updateCredentials: null,
+    });
+
+    const adapter = new BSCAdapter(undefined);
+    const result = await adapter.login("bsc-credentials-seller1");
+    await adapter.cleanup();
+
+    patchPuppeteer();
+
+    assert.equal(result.success, false, "broken login should return a structured failure");
+    assert.equal(counter.calls, 1, "browser.close() must still run when the login flow fails inside Puppeteer");
+  });
+
+  it("is a no-op on the cache-hit path — no browser was launched, so close() is never called", async () => {
+    const counter = { calls: 0 };
+    // Patch puppeteer with an instrumented browser; if the adapter ever
+    // launches one on a cache hit, this counter will catch it.
+    patchPuppeteer(async () => makeInstrumentedBrowser(counter));
+
+    const BSCAdapter = loadBSCAdapter({
+      credentials: {
+        username: "seller@example.com",
+        password: "secret",
+        token: "valid-cached-token",
+        expiresAt: Date.now() + 60 * 60 * 1000,
+      },
+      updateCredentials: null,
+    });
+
+    const restore = stubFetch(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ sellerProfile: { sellerStoreName: "Acme Cards" } }),
+    }));
+
+    const adapter = new BSCAdapter(undefined);
+    const result = await adapter.login("bsc-credentials-seller1");
+    // cleanup() must be safe to call even though no browser was launched.
+    await adapter.cleanup();
+    restore();
+
+    patchPuppeteer();
+
+    assert.equal(result.success, true, "cache-hit path should succeed");
+    assert.match(result.message, /cached token/, "should be the cached path, not fresh");
+    assert.equal(counter.calls, 0, "no browser was launched, so cleanup must not invoke close()");
+  });
+
+  it("closes the freshly-launched browser on the cache-invalid → fresh-login fallthrough path", async () => {
+    const counter = { calls: 0 };
+    patchPuppeteer(async () => makeInstrumentedBrowser(counter));
+
+    const updatedCredentials = [];
+    const BSCAdapter = loadBSCAdapter({
+      credentials: () => {
+        if (updatedCredentials.length === 0) {
+          return {
+            username: "seller@example.com",
+            password: "secret",
+            token: "stale-bare-token",
+            expiresAt: Date.now() + 60 * 60 * 1000,
+          };
+        }
+        return { username: "seller@example.com", password: "secret" };
+      },
+      updateCredentials: (key, creds) => updatedCredentials.push({ key, creds }),
+    });
+
+    // Profile-validation 401 → adapter clears the cache and falls through to
+    // launchPage() inside login(). That launchPage() is the OOM-prone path
+    // that the original bug never closed.
+    const restore = stubFetch(async () => ({
+      ok: false,
+      status: 401,
+      json: async () => ({ error: "Unauthorized" }),
+    }));
+
+    const adapter = new BSCAdapter(undefined);
+    const result = await adapter.login("bsc-credentials-seller1");
+    await adapter.cleanup();
+    restore();
+
+    patchPuppeteer();
+
+    assert.equal(result.success, true, "fallthrough fresh login should succeed");
+    assert.equal(counter.calls, 1, "the freshly-launched browser on the fallthrough path must be closed");
+  });
+
+  it("is idempotent: calling cleanup() twice does not re-close the browser or throw", async () => {
+    const counter = { calls: 0 };
+    patchPuppeteer(async () => makeInstrumentedBrowser(counter));
+
+    const BSCAdapter = loadBSCAdapter({
+      credentials: { username: "seller@example.com", password: "secret" },
+      updateCredentials: null,
+    });
+
+    const adapter = new BSCAdapter(undefined);
+    await adapter.login("bsc-credentials-seller1");
+    await adapter.cleanup();
+    await adapter.cleanup(); // second call must be a no-op
+
+    patchPuppeteer();
+
+    assert.equal(counter.calls, 1, "cleanup() must be idempotent — second call is a no-op");
+  });
+
+  it("swallows errors from browser.close() so cleanup-in-finally never masks the original error", async () => {
+    // browser.close() throwing during cleanup is plausible if the Cloud Run
+    // worker is being preempted. We must not let that bubble out of cleanup
+    // and overwrite the real login result the route handler is about to
+    // return to the caller.
+    const counter = { calls: 0 };
+    patchPuppeteer(async () => ({
+      newPage: async () => defaultMockPage,
+      close: async () => {
+        counter.calls++;
+        throw new Error("Browser already disconnected");
+      },
+    }));
+
+    const BSCAdapter = loadBSCAdapter({
+      credentials: { username: "seller@example.com", password: "secret" },
+      updateCredentials: null,
+    });
+
+    const adapter = new BSCAdapter(undefined);
+    await adapter.login("bsc-credentials-seller1");
+
+    // If cleanup re-throws, this assertion is what fails — it must not.
+    await assert.doesNotReject(
+      adapter.cleanup(),
+      "cleanup() must catch errors from browser.close() so try/finally in route handlers never masks the real error",
+    );
+
+    patchPuppeteer();
+
+    assert.equal(counter.calls, 1, "browser.close() should still have been attempted exactly once");
+  });
+
+  it("closes a separate browser per login when the same adapter instance is reused for multiple sequential logins", async () => {
+    // Real route handlers create a new adapter per request, but defending
+    // the invariant against accidental reuse is cheap and rules out a class
+    // of leaks where a test or future refactor reuses an adapter without
+    // realizing each login() launches a fresh browser.
+    const counter = { calls: 0 };
+    patchPuppeteer(async () => makeInstrumentedBrowser(counter));
+
+    const BSCAdapter = loadBSCAdapter({
+      credentials: { username: "seller@example.com", password: "secret" },
+      updateCredentials: null,
+    });
+
+    const adapter = new BSCAdapter(undefined);
+    await adapter.login("bsc-credentials-seller1");
+    await adapter.cleanup();
+    await adapter.login("bsc-credentials-seller1");
+    await adapter.cleanup();
+    await adapter.login("bsc-credentials-seller1");
+    await adapter.cleanup();
+
+    patchPuppeteer();
+
+    assert.equal(counter.calls, 3, "each sequential login on the same adapter must launch+close its own browser — no orphan processes");
+  });
+});

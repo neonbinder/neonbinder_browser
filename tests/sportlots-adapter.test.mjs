@@ -422,3 +422,49 @@ describe("SportlotsAdapter.login token cache", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Cleanup invariant — pure-HTTP adapter must still be cleanup()-safe
+// ---------------------------------------------------------------------------
+//
+// SportLots is currently pure HTTP — it never calls launchPage/loginWithBrowser
+// in production. But /login/sportlots wraps adapter.login() in try/finally with
+// adapter.cleanup() to keep the invariant uniform across routes. If a future
+// SportLots refactor ever needs Puppeteer (e.g. to handle a Cloudflare
+// challenge), the invariant is already in place. Lock it in: cleanup() must
+// be a safe no-op for the current SportLots flow, and it must not throw even
+// when called repeatedly.
+describe("SportlotsAdapter.cleanup — pure-HTTP no-op safety", () => {
+  it("cleanup() is a no-op after a successful HTTP login (no browser was launched)", async () => {
+    const SportlotsAdapter = loadSportlotsAdapter({
+      credentials: { username: "user@example.com", password: "pw" },
+    });
+
+    // Stub fetch to drive a successful login flow. Order of the calls in
+    // attemptLogin: signin POST, then validation GET. Both must succeed.
+    const original = globalThis.fetch;
+    globalThis.fetch = async (url, _opts) => {
+      const u = String(url);
+      if (u.includes("signin.tpl")) {
+        return {
+          status: 200,
+          text: async () => 'document.cookie = "session=abc; path=/";',
+        };
+      }
+      // validation
+      return { status: 200, text: async () => "<html>Dealer Inventory</html>" };
+    };
+
+    try {
+      const adapter = new SportlotsAdapter(undefined);
+      const result = await adapter.login("sportlots-credentials-user1");
+      assert.equal(result.success, true, "fresh SL login should succeed");
+      // Pure HTTP — nothing to clean up. Must not throw.
+      await assert.doesNotReject(adapter.cleanup(), "SL cleanup must be a safe no-op");
+      // And idempotent — calling twice is fine.
+      await assert.doesNotReject(adapter.cleanup(), "SL cleanup must be idempotent");
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+});

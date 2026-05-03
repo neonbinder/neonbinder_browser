@@ -79,9 +79,16 @@ app.post("/login/sportlots", requireInternalAuth, async (req: Request<{}, {}, { 
     res.status(400).json({ error: "Missing required field: key" });
     return;
   }
+  // Adapter reads credentials from Secret Manager internally. Wrap the call in
+  // try/finally so adapter.cleanup() runs no matter what — that closes any
+  // Puppeteer Browser child process the adapter launched. SportLots is
+  // currently pure HTTP and never launches a browser, but cleanup() is a
+  // no-op in that case, and this keeps the invariant (every adapter call is
+  // paired with cleanup) uniform across routes. See the OOM root-cause
+  // comment on BaseAdapter.launchPage for the failure mode if cleanup is
+  // skipped.
+  const adapter = new SportlotsAdapter(undefined);
   try {
-    // Adapter reads credentials from Secret Manager internally
-    const adapter = new SportlotsAdapter(undefined);
     const result = await adapter.login(key);
     if (result.success) {
       res.json({ success: true, message: result.message });
@@ -96,6 +103,8 @@ app.post("/login/sportlots", requireInternalAuth, async (req: Request<{}, {}, { 
       console.error("Sportlots login failed:", err);
       res.status(500).json({ error: "Login failed" });
     }
+  } finally {
+    await adapter.cleanup();
   }
 });
 
@@ -106,9 +115,16 @@ app.post("/login/bsc", requireInternalAuth, async (req: Request<{}, {}, { key: s
     res.status(400).json({ error: "Missing required field: key" });
     return;
   }
+  // Adapter reads credentials from Secret Manager internally. Wrap the call
+  // in try/finally so adapter.cleanup() runs whether login succeeds, fails,
+  // or throws. Without this, the Puppeteer Browser child process leaks
+  // (~150-200 MiB each) and accumulates across requests on the same Cloud
+  // Run instance until the 2048 MiB ceiling OOM-kills the container
+  // mid-request — which manifested as the misleading "BSC login failed.
+  // Please check your credentials and try again." toast even when BSC
+  // accepted the login (the response just never made it back to Convex).
+  const adapter = new BSCAdapter(undefined);
   try {
-    // Adapter reads credentials from Secret Manager internally
-    const adapter = new BSCAdapter(undefined);
     const result = await adapter.login(key);
     if (result.success) {
       res.json({
@@ -128,6 +144,8 @@ app.post("/login/bsc", requireInternalAuth, async (req: Request<{}, {}, { key: s
       console.error("BSC login failed:", err);
       res.status(500).json({ error: "BSC login failed" });
     }
+  } finally {
+    await adapter.cleanup();
   }
 });
 
