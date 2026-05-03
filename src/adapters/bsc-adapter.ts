@@ -18,8 +18,12 @@ export class BSCAdapter extends BaseAdapter {
     if (result.cached) {
       console.log(`[BSC Adapter] Validating cached token for ${this.siteName}...`);
 
+      // BSC stores the bare token (no "Bearer " prefix) in Secret Manager —
+      // the Convex adapter prepends "Bearer " on every API call, and so must we.
+      // Without the prefix, BSC silently 401s every cached-token validation,
+      // which made the cache invariably fall through to a fresh Puppeteer login.
       const profileResponse = await fetch("https://api-prod.buysportscards.com/marketplace/user/profile", {
-        headers: { "Authorization": this.token! },
+        headers: { "Authorization": `Bearer ${this.token}` },
       });
 
       if (!profileResponse.ok) {
@@ -30,7 +34,18 @@ export class BSCAdapter extends BaseAdapter {
           token: undefined,
           expiresAt: undefined,
         });
-        // Fall through to Puppeteer login below
+        // Fall through to Puppeteer login below. loginWithBrowser short-circuited
+        // on the cache hit and never launched a browser, so we need to launch
+        // one now before the fresh-login flow runs.
+        try {
+          await this.launchPage();
+        } catch (launchError) {
+          console.error(`[BSC Adapter] Failed to launch Puppeteer page after cache invalidation:`, launchError);
+          return {
+            success: false,
+            error: `Failed to launch browser for ${this.siteName} re-authentication`,
+          };
+        }
       } else {
         const profile = await profileResponse.json() as { sellerProfile?: { sellerStoreName?: string } };
         const storeName = profile?.sellerProfile?.sellerStoreName;
