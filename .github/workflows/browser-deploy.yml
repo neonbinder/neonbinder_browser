@@ -256,23 +256,34 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
-  # Push-to-main unified flow (Phase 3 of trunk-based migration).
+  # Push-to-main unified flow (Phase 4: dev mirrors prod's blue/green pattern).
   #
-  #   test → build-push → deploy-dev → dev-smoke → convex-dev-gate
-  #                                                     │
-  #                             ┌───────────────────────┴─────────┐
-  #                         (success)                         (failure)
-  #                             │                                 │
-  #                        deploy-prod                       dev-rollback
-  #                             │
-  #                        prod-smoke + prod-login-probe
-  #                             │
-  #                        prod-promote
+  #   test → build-push → deploy-dev (no_traffic + tag)
+  #                              │
+  #                              ├── dev-smoke (against tagged URL)
+  #                              └── dev-login-probe (against tagged URL)
+  #                                              │
+  #                                       (both succeed)
+  #                                              │
+  #                                       dev-promote (shift traffic to new revision)
+  #                                              │
+  #                                     convex-dev-gate (Maestro on now-live dev)
+  #                                              │
+  #                            ┌─────────────────┴────────────────┐
+  #                        (success)                          (failure)
+  #                            │                                  │
+  #                       deploy-prod (no_traffic + tag)     dev-rollback
+  #                            │
+  #                       prod-smoke + prod-login-probe
+  #                            │
+  #                       prod-promote
   #
-  # Build happens ONCE; the same image SHA tag flows from dev → prod. Dev
-  # gets immediate 100% traffic so the convex Maestro gate can exercise
-  # main's HEAD. Prod uses blue/green (no_traffic + sha tag) so a failed
-  # probe leaves prod serving the previous revision.
+  # Build happens ONCE; the same image SHA tag flows from dev → prod. Both
+  # environments now use blue/green (no_traffic + sha tag): a new revision
+  # only gets traffic after smoke + login-probe pass against its tagged URL.
+  # The prior dev pattern (immediate traffic) caused traffic-pin drift when
+  # dev-rollback fired — every successful run now uses an explicit
+  # `update-traffic --to-revisions=NEW=100`, keeping pin state deterministic.
   # ---------------------------------------------------------------------------
 
   # Build once, push to both dev and prod GCRs. Downstream deploy jobs
@@ -340,8 +351,9 @@ jobs:
           docker push gcr.io/neonbinder/neonbinder-browser:$SHA
           docker push gcr.io/neonbinder/neonbinder-browser:latest
 
-  # Dev deploy: immediate 100% traffic so the Maestro gate runs against the
-  # service URL that dev Convex and the integration-test branch point at.
+  # Dev deploy: blue/green — land the image at 0% traffic under a sha tag.
+  # The tagged URL is exercised by dev-smoke and dev-login-probe before
+  # dev-promote shifts traffic. Mirrors prod's pattern.
   deploy-dev:
     needs: build-push
     if: github.event_name == 'push'
@@ -350,6 +362,8 @@ jobs:
       contents: read
       id-token: write
     outputs:
+      new_revision: ${{ steps.capture-new.outputs.new_revision }}
+      tagged_url: ${{ steps.capture-new.outputs.tagged_url }}
       prev_revision: ${{ steps.capture-prev.outputs.prev_revision }}
     steps:
       - uses: google-github-actions/auth@v2
@@ -369,7 +383,7 @@ jobs:
           echo "Previous dev revision: $PREV"
           echo "prev_revision=$PREV" >> $GITHUB_OUTPUT
 
-      - name: Deploy to dev Cloud Run (immediate traffic)
+      - name: Deploy to dev Cloud Run (no_traffic + sha tag)
         uses: google-github-actions/deploy-cloudrun@v2
         with:
           service: neonbinder-browser
@@ -377,9 +391,34 @@ jobs:
           image: gcr.io/neonbinder-dev/neonbinder-browser:${{ github.sha }}
           project_id: neonbinder-dev
           env_vars: ENVIRONMENT=dev
+          no_traffic: true
+          tag: ${{ needs.build-push.outputs.deploy_tag }}
 
-  # Fast fail before the 20-minute Maestro gate: basic health/auth checks
-  # against the fresh dev revision.
+      - id: capture-new
+        name: Capture new dev revision + tagged URL
+        env:
+          TAG: ${{ needs.build-push.outputs.deploy_tag }}
+        run: |
+          set -euo pipefail
+          NEW=$(gcloud run services describe neonbinder-browser \
+            --region=us-central1 \
+            --project=neonbinder-dev \
+            --format='value(status.latestCreatedRevisionName)')
+          TAGGED_URL=$(gcloud run services describe neonbinder-browser \
+            --region=us-central1 \
+            --project=neonbinder-dev \
+            --format=json \
+            | jq -r ".status.traffic[] | select(.tag == \"$TAG\") | .url")
+          if [ -z "$TAGGED_URL" ] || [ "$TAGGED_URL" = "null" ]; then
+            echo "ERROR: tagged URL for tag=$TAG not found on service."
+            exit 1
+          fi
+          echo "new_revision=$NEW" >> $GITHUB_OUTPUT
+          echo "tagged_url=$TAGGED_URL" >> $GITHUB_OUTPUT
+
+  # Fast fail before promote: basic health/auth checks against the tagged
+  # dev revision (NOT live dev — live dev is still serving the prior
+  # revision until dev-promote runs).
   dev-smoke:
     needs: deploy-dev
     if: github.event_name == 'push'
@@ -400,18 +439,91 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
-      - name: Resolve dev URL + fetch internal API key
+      - name: Fetch internal API key (dev)
         run: |
-          echo "SMOKE_TEST_URL=$(gcloud run services describe neonbinder-browser --project=neonbinder-dev --region=us-central1 --format='value(status.url)')" >> $GITHUB_ENV
           echo "SMOKE_TEST_API_KEY=$(gcloud secrets versions access latest --secret=internal-api-key --project=neonbinder-dev)" >> $GITHUB_ENV
 
-      - name: Run smoke tests against dev
+      - name: Run smoke tests against dev tagged URL
+        env:
+          SMOKE_TEST_URL: ${{ needs.deploy-dev.outputs.tagged_url }}
         run: node --test tests/smoke.test.mjs
+
+  # Real marketplace login round-trip against the tagged dev revision.
+  # Mirrors prod-login-probe and is the parallel of preview-login-probe for
+  # the post-merge lane: catches BSC/SL auth regressions before any traffic
+  # shift happens.
+  dev-login-probe:
+    needs: deploy-dev
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - run: npm ci
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER_DEV }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_DEPLOYER_DEV }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Fetch internal API key (dev)
+        run: |
+          echo "INTERNAL_API_KEY=$(gcloud secrets versions access latest --secret=internal-api-key --project=neonbinder-dev)" >> $GITHUB_ENV
+
+      - name: Run dev-gate integration suite against tagged URL
+        env:
+          TARGET_URL: ${{ needs.deploy-dev.outputs.tagged_url }}
+          BSC_USERNAME: ${{ secrets.MAESTRO_BSC_USERNAME }}
+          BSC_PASSWORD: ${{ secrets.MAESTRO_BSC_PASSWORD }}
+          SPORTLOTS_USERNAME: ${{ secrets.MAESTRO_SPORTLOTS_USERNAME }}
+          SPORTLOTS_PASSWORD: ${{ secrets.MAESTRO_SPORTLOTS_PASSWORD }}
+        run: npm run test:prod-gate
+
+  # Shifts 100% dev traffic to the new sha-tagged revision once smoke and
+  # login-probe pass. Any prior failure skips this job; the previous
+  # revision continues to serve. Pairs with prod-promote in shape, so the
+  # service-traffic state machine is now identical between environments.
+  dev-promote:
+    needs: [deploy-dev, dev-smoke, dev-login-probe]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER_DEV }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_DEPLOYER_DEV }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Promote ${{ needs.deploy-dev.outputs.new_revision }} to 100%
+        run: |
+          set -euo pipefail
+          gcloud run services update-traffic neonbinder-browser \
+            --region=us-central1 \
+            --project=neonbinder-dev \
+            --to-revisions="${{ needs.deploy-dev.outputs.new_revision }}=100"
+          echo "Promotion complete. The sha-tag remains on the revision for later inspection."
 
   # Dispatch the neonbinder_convex E2E suite against integration-test, whose
   # Vercel preview talks to dev Convex and (transitively) dev Cloud Run.
+  # Runs AFTER dev-promote so the integration-test E2E exercises the new
+  # revision (live dev URL now points at it). On failure, dev-rollback
+  # shifts traffic back to the previously-serving revision.
   convex-dev-gate:
-    needs: dev-smoke
+    needs: dev-promote
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
@@ -671,13 +783,15 @@ jobs:
   # failed. Identifies the first failed stage so the issue title points at
   # the actionable step.
   report-failure:
-    needs: [test, build-push, deploy-dev, dev-smoke, convex-dev-gate, dev-rollback, deploy-prod, prod-smoke, prod-login-probe, prod-promote]
+    needs: [test, build-push, deploy-dev, dev-smoke, dev-login-probe, dev-promote, convex-dev-gate, dev-rollback, deploy-prod, prod-smoke, prod-login-probe, prod-promote]
     if: |
       always() && github.event_name == 'push' && (
         needs.test.result == 'failure' ||
         needs.build-push.result == 'failure' ||
         needs.deploy-dev.result == 'failure' ||
         needs.dev-smoke.result == 'failure' ||
+        needs.dev-login-probe.result == 'failure' ||
+        needs.dev-promote.result == 'failure' ||
         needs.convex-dev-gate.result == 'failure' ||
         needs.deploy-prod.result == 'failure' ||
         needs.prod-smoke.result == 'failure' ||
@@ -697,6 +811,8 @@ jobs:
           R_BUILD: ${{ needs.build-push.result }}
           R_DEV: ${{ needs.deploy-dev.result }}
           R_DEV_SMOKE: ${{ needs.dev-smoke.result }}
+          R_DEV_PROBE: ${{ needs.dev-login-probe.result }}
+          R_DEV_PROMOTE: ${{ needs.dev-promote.result }}
           R_GATE: ${{ needs.convex-dev-gate.result }}
           R_ROLLBACK: ${{ needs.dev-rollback.result }}
           R_PROD: ${{ needs.deploy-prod.result }}
@@ -718,6 +834,8 @@ jobs:
           elif [ "$R_BUILD" = "failure" ]; then STAGE=build-push
           elif [ "$R_DEV" = "failure" ]; then STAGE=deploy-dev
           elif [ "$R_DEV_SMOKE" = "failure" ]; then STAGE=dev-smoke
+          elif [ "$R_DEV_PROBE" = "failure" ]; then STAGE=dev-login-probe
+          elif [ "$R_DEV_PROMOTE" = "failure" ]; then STAGE=dev-promote
           elif [ "$R_GATE" = "failure" ]; then STAGE=convex-dev-gate
           elif [ "$R_PROD" = "failure" ]; then STAGE=deploy-prod
           elif [ "$R_PROD_SMOKE" = "failure" ]; then STAGE=prod-smoke
@@ -730,8 +848,12 @@ jobs:
           case "$STAGE" in
             test|build-push)
               BLAST="No infra touched. Dev and prod both still serving their previous revisions." ;;
-            deploy-dev|dev-smoke|convex-dev-gate)
-              BLAST="Dev was redeployed and then rolled back (if dev-rollback ran successfully). Prod never touched. Dev previous revision: \`$DEV_PREV\`, rollback job result: \`$R_ROLLBACK\`." ;;
+            deploy-dev|dev-smoke|dev-login-probe)
+              BLAST="Dev has a parked revision at 0% traffic and is still serving the previous revision (\`$DEV_PREV\`). No promote occurred. Prod never touched." ;;
+            dev-promote)
+              BLAST="Dev blue/green gate passed but the traffic shift call itself failed. Dev still serves \`$DEV_PREV\`. Re-run the promote job manually or investigate update-traffic errors. Prod never touched." ;;
+            convex-dev-gate)
+              BLAST="Dev was promoted to the new revision and then rolled back (if dev-rollback ran successfully). Prod never touched. Dev previous revision: \`$DEV_PREV\`, rollback job result: \`$R_ROLLBACK\`." ;;
             deploy-prod|prod-smoke|prod-login-probe)
               BLAST="Dev is serving main's HEAD. Prod has a parked revision at 0% traffic (\`$NEW_REV\`, tag \`$TAG\`) and is still serving \`$PROD_PREV\`. Tagged URL for local poking: $TAGGED_URL." ;;
             prod-promote)
@@ -752,6 +874,8 @@ jobs:
           | build-push | \`$R_BUILD\` |
           | deploy-dev | \`$R_DEV\` |
           | dev-smoke | \`$R_DEV_SMOKE\` |
+          | dev-login-probe | \`$R_DEV_PROBE\` |
+          | dev-promote | \`$R_DEV_PROMOTE\` |
           | convex-dev-gate | \`$R_GATE\` |
           | dev-rollback | \`$R_ROLLBACK\` |
           | deploy-prod | \`$R_PROD\` |
