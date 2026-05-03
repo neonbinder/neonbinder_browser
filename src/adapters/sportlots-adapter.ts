@@ -7,6 +7,12 @@ import { SecretsManagerService } from "../services/secrets-manager";
 const MAX_ATTEMPTS = 5;
 const BACKOFFS_MS = [500, 1000, 2000, 4000];
 
+// Conservative TTL for cached SL session cookies. SL sessions empirically
+// last much longer (~24h), but we'd rather invalidate eagerly than serve
+// a stale cookie for a day. The cache-hit branch revalidates against a
+// protected endpoint anyway, so the TTL is a belt-and-suspenders ceiling.
+const CACHED_TOKEN_TTL_MS = 4 * 60 * 60 * 1000;
+
 function sleepWithJitter(baseMs: number): Promise<void> {
   const jitter = baseMs * (Math.random() * 0.6 - 0.3); // ±30%
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, baseMs + jitter)));
@@ -22,12 +28,67 @@ export class SportlotsAdapter extends BaseAdapter {
   }
 
   /**
-   * Login to SportLots via HTTP POST, extract JS-set cookies from response body.
-   * Retries up to MAX_ATTEMPTS on transient failures (429, 5xx, network error,
-   * empty cookie body); returns immediately on permanent failures (4xx non-429,
+   * Login to SportLots.
+   *
+   * First, if the per-user secret already holds a non-expired cached cookie,
+   * cheaply revalidate it against /inven/dealbin/newinven.tpl. On hit we
+   * short-circuit and skip the full login flow entirely — this is the fix
+   * for SL rate-limiting the shared CI test username when many flows trigger
+   * /login/sportlots in quick succession (mirrors the BSC adapter pattern).
+   *
+   * On miss (no token / expired / failed revalidation) we clear the stale
+   * cache and fall through to the existing HTTP login flow, which retries up
+   * to MAX_ATTEMPTS on transient failures (429, 5xx, network error, empty
+   * cookie body) and bails immediately on permanent ones (4xx non-429,
    * invalid credentials, validation seeing a login page).
    */
   async login(key: string): Promise<AdapterResponse> {
+    const secretsManager = new SecretsManagerService();
+
+    // Cache hit path: try the stored cookie before hitting the login form.
+    try {
+      const credentials = await secretsManager.getCredentials(key);
+      if (
+        credentials.token &&
+        credentials.expiresAt &&
+        credentials.expiresAt > Date.now()
+      ) {
+        console.log(
+          `[SportLots Adapter] cached token present, validating against ${this.siteName}...`,
+        );
+        const valid = await this.validateCachedCookie(credentials.token);
+        if (valid) {
+          console.log(`[SportLots Adapter] cached token valid; reusing.`);
+          return {
+            success: true,
+            message: `Used cached token for ${this.siteName}`,
+            expiresAt: credentials.expiresAt,
+          };
+        }
+        // Stale or revoked cookie. Clear before falling through so the next
+        // call doesn't waste another validation round trip on the same dead
+        // token. Username/password are preserved.
+        console.log(
+          `[SportLots Adapter] cached token invalid, clearing and re-authenticating...`,
+        );
+        await secretsManager.updateCredentials(key, {
+          username: credentials.username,
+          password: credentials.password,
+          token: undefined,
+          expiresAt: undefined,
+        });
+      }
+    } catch (error) {
+      // Cache lookup failure should never block a fresh login. Log and fall
+      // through. The fresh-login path will hit getCredentials again and
+      // surface a real error if credentials are genuinely unreadable.
+      console.log(
+        `[SportLots Adapter] cache lookup failed, proceeding to fresh login: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+
     let last: AdapterResponse = { success: false, error: "Login did not run" };
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       if (attempt > 1) {
@@ -41,6 +102,59 @@ export class SportlotsAdapter extends BaseAdapter {
       await sleepWithJitter(BACKOFFS_MS[attempt - 1]);
     }
     return last;
+  }
+
+  /**
+   * Cheap GET against a known authenticated page using the stored cookie.
+   *
+   * SportLots responds 200 even to expired session cookies — the body just
+   * contains the public login form instead of the dealer dashboard. So we
+   * can't trust status alone; we apply the same login-page detection used
+   * by attemptLogin() right after a fresh login.
+   *
+   * Any thrown network error (DNS, timeout, ECONNRESET) is treated as
+   * "couldn't validate" rather than "definitely invalid", so the caller
+   * clears the cache and a fresh login retry-loops as normal.
+   *
+   * @returns true if the cookie still authenticates; false otherwise.
+   */
+  private async validateCachedCookie(cookieString: string): Promise<boolean> {
+    try {
+      const response = await fetch(
+        "https://www.sportlots.com/inven/dealbin/newinven.tpl",
+        {
+          method: "GET",
+          headers: { Cookie: cookieString },
+          redirect: "manual",
+        },
+      );
+      // 3xx redirect or non-200 → don't trust this cookie.
+      if (response.status !== 200) {
+        console.log(
+          `[SportLots Adapter] cached-cookie validation status=${response.status}; treating as invalid`,
+        );
+        return false;
+      }
+      const body = await response.text();
+      // Same heuristic as the post-fresh-login validation: SL silently
+      // rewrites the body to the login form when the session is gone.
+      if (body.includes("login.tpl") || body.includes("signin.tpl")) {
+        console.log(
+          `[SportLots Adapter] cached-cookie validation body contained login/signin reference; treating as invalid`,
+        );
+        return false;
+      }
+      return true;
+    } catch (error) {
+      console.log(
+        `[SportLots Adapter] cached-cookie validation threw: ${
+          error instanceof Error
+            ? `${error.name}: ${error.message}`
+            : String(error)
+        }`,
+      );
+      return false;
+    }
   }
 
   /**
@@ -156,17 +270,21 @@ export class SportlotsAdapter extends BaseAdapter {
         };
       }
 
-      // Store the cookie as a token
+      // Store the cookie + TTL so login() can short-circuit on the next
+      // call. Without expiresAt, the cache-hit branch above can never fire.
+      const expiresAt = Date.now() + CACHED_TOKEN_TTL_MS;
       await secretsManager.updateCredentials(key, {
         username: credentials.username,
         password: credentials.password,
         token: cookieString,
+        expiresAt,
       });
       log("login success; token stored");
 
       return {
         success: true,
         message: `Successfully logged into ${this.siteName}`,
+        expiresAt,
       };
     } catch (error) {
       log(`login threw: ${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}`);
