@@ -52,6 +52,31 @@ abstract login(key: string): Promise<AdapterResponse>;
   }
 
   /**
+   * Launches a fresh Puppeteer browser+page configured for marketplace
+   * automation, assigns it to this.page, and returns it. Use this when an
+   * adapter needs a page after the cached-token branch has already run
+   * (e.g. BSC re-authenticates after a stale-token 401). If a page is
+   * supplied, it's used as-is and no browser is launched.
+   *
+   * Security: callers must not log credentials around the page-launch
+   * boundary. The returned page has no credentials attached yet.
+   */
+  protected async launchPage(page?: Page | null): Promise<Page> {
+    if (page) {
+      this.page = page;
+      return page;
+    }
+    const browser: Browser = await puppeteer.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--window-size=1920,1080"],
+    });
+    const launched = await browser.newPage();
+    await launched.setViewport({ width: 1920, height: 1080 });
+    this.page = launched;
+    return launched;
+  }
+
+  /**
    * Handles browser and token logic for login.
    * If a valid, non-expired token is found, sets this.token and returns { cached: true }.
    * Otherwise, launches a Puppeteer page, sets this.page, and returns { cached: false, page }.
@@ -65,17 +90,7 @@ abstract login(key: string): Promise<AdapterResponse>;
       return { cached: true };
     }
     // Otherwise, create a browser and page if not provided
-    let browser: Browser | null = null;
-    if (!page) {
-      browser = await puppeteer.launch({
-        headless: true,
-        args: ["--no-sandbox", "--disable-setuid-sandbox", "--window-size=1920,1080"],
-      });
-      page = await browser.newPage();
-      await page.setViewport({ width: 1920, height: 1080 });
-    }
-    this.page = page;
-
-    return { cached: false, page };
+    const launched = await this.launchPage(page);
+    return { cached: false, page: launched };
   }
 } 
