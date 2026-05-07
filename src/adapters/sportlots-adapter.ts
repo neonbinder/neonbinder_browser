@@ -9,9 +9,14 @@ const BACKOFFS_MS = [500, 1000, 2000, 4000];
 
 // Conservative TTL for cached SL session cookies. SL sessions empirically
 // last much longer (~24h), but we'd rather invalidate eagerly than serve
-// a stale cookie for a day. The cache-hit branch revalidates against a
-// protected endpoint anyway, so the TTL is a belt-and-suspenders ceiling.
-const CACHED_TOKEN_TTL_MS = 4 * 60 * 60 * 1000;
+// SportLots sessions are effectively permanent — once authenticated, the
+// session cookie persists indefinitely until the user explicitly logs
+// out or SL purges the session server-side (rare). We set a long cache
+// TTL (30 days) and lean on the validate-on-cache-hit branch above to
+// catch sessions that turn out to be dead. Previous 4-hour TTL was
+// over-cautious and forced unnecessary Puppeteer-free re-logins on
+// long-running browser sessions.
+const CACHED_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 function sleepWithJitter(baseMs: number): Promise<void> {
   const jitter = baseMs * (Math.random() * 0.6 - 0.3); // ±30%

@@ -12,6 +12,10 @@ interface LoginResponse {
   message?: string;
   expiresAt?: number;
   storeName?: string;
+  // BSC seller identifier captured during login; persisted by the Convex
+  // layer to userProfiles.marketplaceAccountIds.bscSellerId. Other adapters
+  // leave this undefined.
+  sellerId?: string;
 }
 
 interface ErrorResponse {
@@ -132,6 +136,7 @@ app.post("/login/bsc", requireInternalAuth, async (req: Request<{}, {}, { key: s
         message: result.message,
         expiresAt: result.expiresAt,
         storeName: result.storeName,
+        sellerId: result.sellerId,
       });
     } else {
       res.status(500).json({ error: result.error || result.message || "BSC login failed" });
