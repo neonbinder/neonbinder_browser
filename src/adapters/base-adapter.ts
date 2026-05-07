@@ -11,6 +11,14 @@ export interface AdapterResponse {
   message?: string;
   error?: string;
   storeName?: string;
+  /**
+   * Marketplace-specific seller / account identifier captured at login time
+   * so callers don't have to re-derive it on every API request. For BSC,
+   * this is the value used as the `sellerId` field in /search/seller/results
+   * request bodies. Persisted to userProfiles.marketplaceAccountIds in the
+   * Convex layer.
+   */
+  sellerId?: string;
   expiresAt?: number;
   /**
    * Set by adapters on `success: false` to indicate whether the caller

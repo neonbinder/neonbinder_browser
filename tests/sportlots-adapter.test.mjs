@@ -382,7 +382,7 @@ describe("SportlotsAdapter.login token cache", () => {
     }
   });
 
-  it("persists the fresh cookie with a future expiresAt (~4h TTL)", async () => {
+  it("persists the fresh cookie with a future expiresAt (~30d TTL)", async () => {
     const updates = [];
     const SportlotsAdapter = loadSportlotsAdapter({
       credentials: { username: "user@example.com", password: "pw" },
@@ -401,16 +401,16 @@ describe("SportlotsAdapter.login token cache", () => {
       const persisted = updates[0].creds;
       assert.ok(persisted.token, "persisted cookie must have token field");
       assert.ok(typeof persisted.expiresAt === "number", "expiresAt must be a number");
-      const fourHoursMs = 4 * 60 * 60 * 1000;
+      const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
       // Allow a small ±5s window for slow test runners. Lower bound: at least
-      // 4h after the call started; upper bound: at most 4h after the call ended.
+      // 30d after the call started; upper bound: at most 30d after the call ended.
       assert.ok(
-        persisted.expiresAt >= beforeMs + fourHoursMs - 5000,
-        `expiresAt should be ~4h in the future (got ${persisted.expiresAt - beforeMs}ms ahead of start)`,
+        persisted.expiresAt >= beforeMs + thirtyDaysMs - 5000,
+        `expiresAt should be ~30d in the future (got ${persisted.expiresAt - beforeMs}ms ahead of start)`,
       );
       assert.ok(
-        persisted.expiresAt <= afterMs + fourHoursMs + 5000,
-        `expiresAt should be ~4h in the future (got ${persisted.expiresAt - afterMs}ms ahead of end)`,
+        persisted.expiresAt <= afterMs + thirtyDaysMs + 5000,
+        `expiresAt should be ~30d in the future (got ${persisted.expiresAt - afterMs}ms ahead of end)`,
       );
       assert.equal(
         result.expiresAt,

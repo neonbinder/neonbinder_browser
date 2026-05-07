@@ -155,7 +155,7 @@ describe("BSCAdapter.login — cache-hit path", () => {
         ok: true,
         status: 200,
         json: async () => ({
-          sellerProfile: { sellerStoreName: "Acme Cards" },
+          sellerProfile: { sellerStoreName: "Acme Cards", sellerId: "abcd1234efgh" },
         }),
       };
     });
@@ -166,6 +166,7 @@ describe("BSCAdapter.login — cache-hit path", () => {
 
     assert.equal(result.success, true, "should succeed");
     assert.equal(result.storeName, "Acme Cards", "should include the store name from profile");
+    assert.equal(result.sellerId, "abcd1234efgh", "should surface sellerId from profile so Convex can persist it");
     assert.ok(result.expiresAt > Date.now(), "should return a future expiresAt");
     assert.match(result.message, /cached token/, "message should reference cached token");
     assert.equal(updates.length, 0, "must NOT mutate the secret on a clean cache hit");
@@ -233,13 +234,26 @@ describe("BSCAdapter.login — cache-invalid → fresh-login path", () => {
       updateCredentials: (key, creds) => updatedCredentials.push({ key, creds }),
     });
 
+    // Two profile fetches now happen on this path:
+    //   1. validation of the stale cached token → 401 (triggers fresh login)
+    //   2. post-fresh-login profile fetch to capture sellerId → 200
+    // We return 401 on the first call and 200 on subsequent calls.
     let profileCalls = 0;
     const restore = stubFetch(async () => {
       profileCalls++;
+      if (profileCalls === 1) {
+        return {
+          ok: false,
+          status: 401,
+          json: async () => ({ error: "Unauthorized" }),
+        };
+      }
       return {
-        ok: false,
-        status: 401,
-        json: async () => ({ error: "Unauthorized" }),
+        ok: true,
+        status: 200,
+        json: async () => ({
+          sellerProfile: { sellerStoreName: "Acme Cards", sellerId: "fresh-seller-id" },
+        }),
       };
     });
 
@@ -247,8 +261,9 @@ describe("BSCAdapter.login — cache-invalid → fresh-login path", () => {
     const result = await adapter.login("bsc-credentials-seller1");
     restore();
 
-    assert.equal(profileCalls, 1, "should validate cached token exactly once");
+    assert.equal(profileCalls, 2, "should validate cached token (401), then re-fetch profile after fresh login (200)");
     assert.equal(result.success, true, "fresh login should succeed after stale-cache clear");
+    assert.equal(result.sellerId, "fresh-seller-id", "should surface sellerId captured after fresh login");
     assert.match(result.message, /Successfully logged into/, "message should reflect fresh login, not cached");
 
     // First update: clearing the stale token. Second update: persisting the new token.
@@ -335,10 +350,20 @@ describe("BSCAdapter.login — fresh-login path (no cached token)", () => {
       updateCredentials: (key, creds) => updatedCredentials.push({ key, creds }),
     });
 
-    // No fetch should be hit on the fresh-login path; if the adapter calls
-    // the profile API here it's a regression.
+    // The fresh-login path now performs a single profile fetch after
+    // persisting the extracted token, so we can return both storeName
+    // and sellerId in the same response shape as the cached-token path.
+    let profileCalls = 0;
     const restore = stubFetch(async (url) => {
-      throw new Error(`unexpected fetch on fresh-login path: ${url}`);
+      profileCalls++;
+      assert.equal(new URL(url).hostname, "api-prod.buysportscards.com", "post-login fetch should target BSC profile API");
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          sellerProfile: { sellerStoreName: "Fresh Store", sellerId: "fresh-login-seller" },
+        }),
+      };
     });
     const beforeMs = Date.now();
     const adapter = new BSCAdapter(undefined);
@@ -346,7 +371,10 @@ describe("BSCAdapter.login — fresh-login path (no cached token)", () => {
     const afterMs = Date.now();
     restore();
 
+    assert.equal(profileCalls, 1, "should fetch profile exactly once after fresh login to capture sellerId");
     assert.equal(result.success, true, "fresh login should succeed");
+    assert.equal(result.storeName, "Fresh Store", "should surface storeName from post-login profile");
+    assert.equal(result.sellerId, "fresh-login-seller", "should surface sellerId from post-login profile");
     assert.equal(updatedCredentials.length, 1, "should persist the extracted token exactly once");
     const persisted = updatedCredentials[0].creds;
     assert.equal(persisted.token, "Bearer fresh-extracted-token", "should persist what evaluate() returned");

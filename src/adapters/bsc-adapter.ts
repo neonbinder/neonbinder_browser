@@ -2,6 +2,19 @@ import { Page } from "puppeteer";
 import { BaseAdapter, AdapterResponse } from "./base-adapter";
 import { SecretsManagerService } from "../services/secrets-manager";
 
+interface BscSellerProfile {
+  // Confirmed live from /marketplace/user/profile: `sellerId` is the
+  // canonical field. Other identifiers in the response (userId, sellerEmailId,
+  // sellerStoreName) serve different purposes and are NOT what
+  // /search/seller/results expects in its `sellerId` body field.
+  sellerId?: string;
+  sellerStoreName?: string;
+}
+
+interface BscProfileResponse {
+  sellerProfile?: BscSellerProfile;
+}
+
 export class BSCAdapter extends BaseAdapter {
   constructor(page?: Page) {
     super(page, "BuySportsCards (BSC)");
@@ -9,6 +22,29 @@ export class BSCAdapter extends BaseAdapter {
 
   getHomeUrl(): string {
     return "https://www.buysportscards.com";
+  }
+
+  /**
+   * Fetch the authenticated BSC user's marketplace profile. Used both to
+   * validate cached tokens and to capture the user's sellerId at login.
+   * Returns null on any non-OK response so callers can choose between
+   * re-authentication and graceful degradation.
+   */
+  private async fetchSellerProfile(token: string): Promise<{ storeName?: string; sellerId?: string } | null> {
+    const response = await fetch("https://api-prod.buysportscards.com/marketplace/user/profile", {
+      headers: { "Authorization": `Bearer ${token}` },
+    });
+    if (!response.ok) return null;
+    const profile = (await response.json()) as BscProfileResponse;
+    const sellerProfile = profile?.sellerProfile;
+    if (!sellerProfile) {
+      console.warn(`[BSC Adapter] /marketplace/user/profile returned no sellerProfile. Top-level keys:`, Object.keys(profile ?? {}));
+      return {};
+    }
+    return {
+      storeName: sellerProfile.sellerStoreName,
+      sellerId: sellerProfile.sellerId,
+    };
   }
 
   async login(key: string): Promise<AdapterResponse> {
@@ -22,12 +58,10 @@ export class BSCAdapter extends BaseAdapter {
       // the Convex adapter prepends "Bearer " on every API call, and so must we.
       // Without the prefix, BSC silently 401s every cached-token validation,
       // which made the cache invariably fall through to a fresh Puppeteer login.
-      const profileResponse = await fetch("https://api-prod.buysportscards.com/marketplace/user/profile", {
-        headers: { "Authorization": `Bearer ${this.token}` },
-      });
+      const profile = await this.fetchSellerProfile(this.token!);
 
-      if (!profileResponse.ok) {
-        console.log(`[BSC Adapter] Cached token is invalid (${profileResponse.status}), clearing and re-authenticating...`);
+      if (!profile) {
+        console.log(`[BSC Adapter] Cached token is invalid, clearing and re-authenticating...`);
         const existing = await secretsManager.getCredentials(key);
         await secretsManager.updateCredentials(key, {
           ...existing,
@@ -47,13 +81,17 @@ export class BSCAdapter extends BaseAdapter {
           };
         }
       } else {
-        const profile = await profileResponse.json() as { sellerProfile?: { sellerStoreName?: string } };
-        const storeName = profile?.sellerProfile?.sellerStoreName;
-        console.log(`[BSC Adapter] Cached token valid. Store: ${storeName}`);
+        // Log a 4-char prefix only — sellerId is a per-user BSC identifier
+        // and full values in Cloud Logging would let log-readers correlate
+        // Clerk users to BSC seller accounts. Prefix is enough for support
+        // triage; full value lives in /marketplace/user/profile if needed.
+        const sellerIdPrefix = profile.sellerId ? `${profile.sellerId.slice(0, 4)}…` : "(unknown)";
+        console.log(`[BSC Adapter] Cached token valid. Store: ${profile.storeName} sellerId: ${sellerIdPrefix}`);
         return {
           success: true,
           message: `Used cached token for ${this.siteName}`,
-          storeName,
+          storeName: profile.storeName,
+          sellerId: profile.sellerId,
           expiresAt: Date.now() + (60 * 60 * 1000),
         };
       }
@@ -190,10 +228,25 @@ export class BSCAdapter extends BaseAdapter {
           expiresAt
         });
         console.log(`[BSC Adapter] Stored token in Secret Manager for ${this.siteName}`);
+
+        // Fetch the seller profile so we can return both storeName and
+        // sellerId in the same response shape as the cached-token path.
+        // Profile lookup failure here is non-fatal — we already have a
+        // valid token; the caller just won't get a sellerId this round.
+        const profile = await this.fetchSellerProfile(token);
+        if (profile) {
+          const sellerIdPrefix = profile.sellerId ? `${profile.sellerId.slice(0, 4)}…` : "(unknown)";
+          console.log(`[BSC Adapter] Fresh login profile. Store: ${profile.storeName} sellerId: ${sellerIdPrefix}`);
+        } else {
+          console.warn(`[BSC Adapter] Fresh login: /marketplace/user/profile returned non-OK; storeName + sellerId omitted.`);
+        }
+
         return {
           success: true,
           message: `Successfully logged into ${this.siteName}`,
           expiresAt,
+          storeName: profile?.storeName,
+          sellerId: profile?.sellerId,
         };
       }
       
