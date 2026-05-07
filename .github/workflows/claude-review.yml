@@ -37,12 +37,24 @@ jobs:
           #   "Either ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN is
           #    required when using direct Anthropic API."
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          prompt: "Review this pull request for code quality, correctness, security vulnerabilities (OWASP Top 10), and adherence to project conventions in CLAUDE.md. Focus on: (1) credential/secret handling — this service talks to Secret Manager, (2) Puppeteer/Chrome safety, (3) Convex integration via NEONBINDER_BROWSER_URL, (4) error handling and auth middleware. Post findings as inline review comments on the PR. Be specific about file:line."
-          # `--max-turns 5` was set when this workflow was created in April
-          # and PRs were tiny CI tweaks. As feature PRs landed, that budget
-          # ran out mid-review (a "turn" = one tool call, so reading a few
-          # files and posting comments easily exceeds 5). Bump to 20 — Claude
-          # exits early when there's nothing left to do, so small PRs are
-          # unaffected; large PRs now get a complete review instead of an
-          # `error_max_turns` failure.
-          claude_args: "--max-turns 20"
+          # Summary-comment mode: post a SINGLE consolidated review
+          # comment instead of N inline comments. Each inline comment =
+          # 1 tool call, so a thorough review of a multi-file PR easily
+          # consumed 20+ turns just on comment-posting. One summary
+          # comment drops that overhead to 1 turn for the same findings.
+          prompt: |
+            Review this pull request for security, correctness, and
+            adherence to CLAUDE.md conventions. Focus on:
+              1. Credential/secret handling (Secret Manager, never logged in plaintext)
+              2. Puppeteer/Chrome safety (cleanup, no resource leaks)
+              3. Auth middleware + Convex integration via NEONBINDER_BROWSER_URL
+
+            Read the PR diff and any source files needed for context, then
+            post EXACTLY ONE consolidated review comment on the PR with
+            your findings organized by severity (Blocker / Major / Minor).
+            For each finding include the relevant file:line. Do not post
+            inline comments — one summary comment is sufficient.
+          # 30 turns gives ample headroom: ~5 turns for diff/file reads,
+          # ~3 for the summary comment, leaving 20+ for any deeper
+          # cross-file investigation. Claude exits early when finished.
+          claude_args: "--max-turns 30"
