@@ -3,6 +3,14 @@ name: Claude PR Review
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+    # The action's GitHub App rejects OIDC token exchange when the
+    # workflow file on the PR differs from main (anti-tamper guard).
+    # That makes a self-modifying PR to this file structurally
+    # impossible to pass, even though the change itself is benign.
+    # Skip the run entirely on workflow-only PRs — the author + CodeQL
+    # + manual review still gate workflow changes.
+    paths-ignore:
+      - ".github/workflows/claude-review.yml"
   workflow_dispatch:
     inputs:
       pr_number:
