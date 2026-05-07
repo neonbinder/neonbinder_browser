@@ -30,5 +30,12 @@ jobs:
 
       - uses: anthropics/claude-code-action@v1
         with:
+          # Required for the action to call the Anthropic API. The OIDC
+          # → GitHub App token exchange handles GH-side comment posting,
+          # but the LLM call itself needs an Anthropic credential.
+          # Without this the action exits with:
+          #   "Either ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN is
+          #    required when using direct Anthropic API."
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           prompt: "Review this pull request for code quality, correctness, security vulnerabilities (OWASP Top 10), and adherence to project conventions in CLAUDE.md. Focus on: (1) credential/secret handling — this service talks to Secret Manager, (2) Puppeteer/Chrome safety, (3) Convex integration via NEONBINDER_BROWSER_URL, (4) error handling and auth middleware. Post findings as inline review comments on the PR. Be specific about file:line."
           claude_args: "--max-turns 5"
