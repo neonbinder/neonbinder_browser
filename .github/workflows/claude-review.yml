@@ -30,12 +30,7 @@ jobs:
         with:
           fetch-depth: 1
 
-      # Non-blocking: if the review action errors, the PR check still
-      # surfaces the failure but does not gate the merge. We use the
-      # review's findings as advisory input, not as a quality gate —
-      # the test / CodeQL / preview-* checks are the real gates.
       - uses: anthropics/claude-code-action@v1
-        continue-on-error: true
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           prompt: |
