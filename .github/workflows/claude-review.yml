@@ -38,4 +38,11 @@ jobs:
           #    required when using direct Anthropic API."
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           prompt: "Review this pull request for code quality, correctness, security vulnerabilities (OWASP Top 10), and adherence to project conventions in CLAUDE.md. Focus on: (1) credential/secret handling — this service talks to Secret Manager, (2) Puppeteer/Chrome safety, (3) Convex integration via NEONBINDER_BROWSER_URL, (4) error handling and auth middleware. Post findings as inline review comments on the PR. Be specific about file:line."
-          claude_args: "--max-turns 5"
+          # `--max-turns 5` was set when this workflow was created in April
+          # and PRs were tiny CI tweaks. As feature PRs landed, that budget
+          # ran out mid-review (a "turn" = one tool call, so reading a few
+          # files and posting comments easily exceeds 5). Bump to 20 — Claude
+          # exits early when there's nothing left to do, so small PRs are
+          # unaffected; large PRs now get a complete review instead of an
+          # `error_max_turns` failure.
+          claude_args: "--max-turns 20"
