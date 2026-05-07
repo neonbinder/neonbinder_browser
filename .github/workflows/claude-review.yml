@@ -27,34 +27,44 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - uses: anthropics/claude-code-action@v1
         with:
-          # Required for the action to call the Anthropic API. The OIDC
-          # → GitHub App token exchange handles GH-side comment posting,
-          # but the LLM call itself needs an Anthropic credential.
-          # Without this the action exits with:
-          #   "Either ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN is
-          #    required when using direct Anthropic API."
+          fetch-depth: 1
+
+      # Non-blocking: if the review action errors, the PR check still
+      # surfaces the failure but does not gate the merge. We use the
+      # review's findings as advisory input, not as a quality gate —
+      # the test / CodeQL / preview-* checks are the real gates.
+      - uses: anthropics/claude-code-action@v1
+        continue-on-error: true
+        with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          # Summary-comment mode: post a SINGLE consolidated review
-          # comment instead of N inline comments. Each inline comment =
-          # 1 tool call, so a thorough review of a multi-file PR easily
-          # consumed 20+ turns just on comment-posting. One summary
-          # comment drops that overhead to 1 turn for the same findings.
           prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+
             Review this pull request for security, correctness, and
             adherence to CLAUDE.md conventions. Focus on:
               1. Credential/secret handling (Secret Manager, never logged in plaintext)
               2. Puppeteer/Chrome safety (cleanup, no resource leaks)
               3. Auth middleware + Convex integration via NEONBINDER_BROWSER_URL
 
-            Read the PR diff and any source files needed for context, then
-            post EXACTLY ONE consolidated review comment on the PR with
-            your findings organized by severity (Blocker / Major / Minor).
-            For each finding include the relevant file:line. Do not post
-            inline comments — one summary comment is sufficient.
-          # 30 turns gives ample headroom: ~5 turns for diff/file reads,
-          # ~3 for the summary comment, leaving 20+ for any deeper
-          # cross-file investigation. Claude exits early when finished.
-          claude_args: "--max-turns 30"
+            How to gather context (use these tools, in this order):
+              - `gh pr view <PR> --json title,body,files` for metadata
+              - `gh pr diff <PR>` for the diff
+              - `Read` for any source file you need to inspect for context
+              - `Grep` / `Glob` for cross-file searches when needed
+
+            How to deliver findings:
+              - For specific code issues, post inline comments via
+                `mcp__github_inline_comment__create_inline_comment`
+                (with `confirmed: true`).
+              - For high-level / cross-cutting feedback, use
+                `gh pr comment <PR> --body "..."`.
+              - Organize feedback by severity: Blocker / Major / Minor.
+              - If the PR is clean, post a single short approval comment.
+              - Do NOT submit review text as plain output — only via
+                GitHub comments.
+          claude_args: |
+            --model claude-sonnet-4-6
+            --max-turns 20
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Read,Grep,Glob"
