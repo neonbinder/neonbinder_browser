@@ -1,5 +1,4 @@
-import express, { Request, Response, NextFunction } from "express";
-import { timingSafeEqual } from "crypto";
+import express, { Request, Response } from "express";
 import rateLimit from "express-rate-limit";
 import helmet from "helmet";
 import { SUPPORTED_SITES } from "./adapters";
@@ -48,36 +47,26 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-// --- Timing-safe authentication middleware ---
-function requireInternalAuth(req: Request, res: Response, next: NextFunction): void {
-  const apiKey = req.headers["x-internal-key"];
-  const expected = process.env.INTERNAL_API_KEY;
-
-  if (
-    !apiKey ||
-    !expected ||
-    typeof apiKey !== "string" ||
-    apiKey.length !== expected.length ||
-    !timingSafeEqual(Buffer.from(apiKey), Buffer.from(expected))
-  ) {
-    res.status(401).json({ error: "Unauthorized" });
-    return;
-  }
-  next();
-}
+// NEO-20: authentication is now enforced upstream by Cloud Run IAM (only the
+// neonbinder-convex service account holds roles/run.invoker on this service).
+// We deliberately do not run an app-layer auth check here — Cloud Run rejects
+// unauthorized requests with 403 before they ever reach Express. The previous
+// x-internal-key middleware was redundant once IAM was in front and a hazard
+// when the service was still --allow-unauthenticated. The /health endpoint
+// remains public so Cloud Run's HTTP probe can reach it.
 
 // Health endpoint
 app.get("/health", (_req: Request, res: Response) => {
   res.json({ status: "ok", environment: ENV });
 });
 
-// Get list of supported sites (requires auth)
-app.get("/sites", requireInternalAuth, (_req: Request, res: Response<SitesResponse>) => {
+// Get list of supported sites
+app.get("/sites", (_req: Request, res: Response<SitesResponse>) => {
   res.json({ sites: SUPPORTED_SITES });
 });
 
 // Site-specific login endpoints
-app.post("/login/sportlots", requireInternalAuth, async (req: Request<{}, {}, { key: string }>, res: Response<LoginResponse | ErrorResponse>) => {
+app.post("/login/sportlots", async (req: Request<{}, {}, { key: string }>, res: Response<LoginResponse | ErrorResponse>) => {
   const { key } = req.body;
   if (!key) {
     res.status(400).json({ error: "Missing required field: key" });
@@ -113,7 +102,7 @@ app.post("/login/sportlots", requireInternalAuth, async (req: Request<{}, {}, { 
 });
 
 // BSC login endpoint: accepts username/password, stores in GCP, logs in via Puppeteer
-app.post("/login/bsc", requireInternalAuth, async (req: Request<{}, {}, { key: string }>, res: Response<LoginResponse | ErrorResponse>) => {
+app.post("/login/bsc", async (req: Request<{}, {}, { key: string }>, res: Response<LoginResponse | ErrorResponse>) => {
   const { key } = req.body;
   if (!key) {
     res.status(400).json({ error: "Missing required field: key" });
@@ -157,7 +146,7 @@ app.post("/login/bsc", requireInternalAuth, async (req: Request<{}, {}, { key: s
 // --- Credential CRUD endpoints ---
 
 // Store credentials for a key (no marketplace validation)
-app.put("/credentials/:key", requireInternalAuth, async (req: Request<{ key: string }, {}, { username: string; password: string }>, res: Response) => {
+app.put("/credentials/:key", async (req: Request<{ key: string }, {}, { username: string; password: string }>, res: Response) => {
   const { username, password } = req.body;
   if (!username || !password) {
     res.status(400).json({ error: "Missing required fields: username, password" });
@@ -179,7 +168,7 @@ app.put("/credentials/:key", requireInternalAuth, async (req: Request<{ key: str
 });
 
 // Get credential metadata (no secrets) for a key
-app.get("/credentials/:key/metadata", requireInternalAuth, async (req: Request<{ key: string }>, res: Response) => {
+app.get("/credentials/:key/metadata", async (req: Request<{ key: string }>, res: Response) => {
   try {
     const secretsManager = new SecretsManagerService();
     const credentials = await secretsManager.getCredentials(req.params.key);
@@ -202,7 +191,7 @@ app.get("/credentials/:key/metadata", requireInternalAuth, async (req: Request<{
 });
 
 // Get token only (for internal adapter use — no username/password exposed)
-app.get("/credentials/:key/token", requireInternalAuth, async (req: Request<{ key: string }>, res: Response) => {
+app.get("/credentials/:key/token", async (req: Request<{ key: string }>, res: Response) => {
   try {
     const secretsManager = new SecretsManagerService();
     const credentials = await secretsManager.getCredentials(req.params.key);
@@ -228,7 +217,7 @@ app.get("/credentials/:key/token", requireInternalAuth, async (req: Request<{ ke
 });
 
 // Delete credentials for a key
-app.delete("/credentials/:key", requireInternalAuth, async (req: Request<{ key: string }>, res: Response) => {
+app.delete("/credentials/:key", async (req: Request<{ key: string }>, res: Response) => {
   try {
     const secretsManager = new SecretsManagerService();
     await secretsManager.deleteCredentials(req.params.key);
@@ -245,7 +234,7 @@ app.delete("/credentials/:key", requireInternalAuth, async (req: Request<{ key: 
 });
 
 // Check which keys have credentials
-app.post("/credentials/check", requireInternalAuth, async (req: Request<{}, {}, { keys: string[] }>, res: Response) => {
+app.post("/credentials/check", async (req: Request<{}, {}, { keys: string[] }>, res: Response) => {
   const { keys } = req.body || {};
   if (!Array.isArray(keys) || keys.some((key) => typeof key !== "string")) {
     res.status(400).json({ error: "Invalid request body: 'keys' must be an array of strings" });

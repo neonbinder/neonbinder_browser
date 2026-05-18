@@ -19,7 +19,11 @@ steps:
       - 'us-central1'
       - '--platform'
       - 'managed'
-      - '--allow-unauthenticated'
+      # NEO-20: this service exposes marketplace auth tokens behind
+      # /credentials/:key/token. Public ingress is unacceptable. Access is
+      # gated by Cloud Run IAM (roles/run.invoker on the neonbinder-convex
+      # service account) — explicitly require auth on every deploy.
+      - '--no-allow-unauthenticated'
       - '--memory'
       - '1Gi'
       - '--timeout'
