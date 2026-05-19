@@ -9,8 +9,10 @@
  * The in-memory SecretsManagerService mirrors the error-throwing behavior of
  * the real one so that error-path tests (404, 400 for bad key format) work.
  *
- * Auth is exercised by setting INTERNAL_API_KEY in the environment and sending
- * matching / non-matching x-internal-key headers.
+ * NEO-20: app-layer auth was removed in favor of Cloud Run IAM, so these
+ * tests no longer exercise an Authorization check — Cloud Run runs in front
+ * of Express and is out of scope for an in-process test. We rely on the
+ * smoke suite (against a real Cloud Run deployment) to verify the IAM gate.
  */
 
 import { describe, it, before, after } from "node:test";
@@ -67,9 +69,8 @@ class InMemorySecretsManager {
 // Build the Express app — mirrors index.ts structure but uses injectable deps
 // ---------------------------------------------------------------------------
 
-function buildApp({ secretsManager, apiKey, env = "dev" }) {
+function buildApp({ secretsManager }) {
   const express = require("express");
-  const { timingSafeEqual } = require("crypto");
   const rateLimit = require("express-rate-limit");
   const helmet = require("helmet");
 
@@ -88,25 +89,8 @@ function buildApp({ secretsManager, apiKey, env = "dev" }) {
   });
   app.use(limiter);
 
-  // Auth middleware — identical logic to index.ts
-  function requireInternalAuth(req, res, next) {
-    const incomingKey = req.headers["x-internal-key"];
-    const expected = apiKey;
-    if (
-      !incomingKey ||
-      !expected ||
-      typeof incomingKey !== "string" ||
-      incomingKey.length !== expected.length ||
-      !timingSafeEqual(Buffer.from(incomingKey), Buffer.from(expected))
-    ) {
-      res.status(401).json({ error: "Unauthorized" });
-      return;
-    }
-    next();
-  }
-
   // PUT /credentials/:key
-  app.put("/credentials/:key", requireInternalAuth, async (req, res) => {
+  app.put("/credentials/:key", async (req, res) => {
     const { username, password } = req.body;
     if (!username || !password) {
       res.status(400).json({ error: "Missing required fields: username, password" });
@@ -126,7 +110,7 @@ function buildApp({ secretsManager, apiKey, env = "dev" }) {
   });
 
   // GET /credentials/:key/metadata
-  app.get("/credentials/:key/metadata", requireInternalAuth, async (req, res) => {
+  app.get("/credentials/:key/metadata", async (req, res) => {
     try {
       const credentials = await secretsManager.getCredentials(req.params.key);
       res.json({
@@ -147,7 +131,7 @@ function buildApp({ secretsManager, apiKey, env = "dev" }) {
   });
 
   // DELETE /credentials/:key
-  app.delete("/credentials/:key", requireInternalAuth, async (req, res) => {
+  app.delete("/credentials/:key", async (req, res) => {
     try {
       await secretsManager.deleteCredentials(req.params.key);
       res.json({ success: true, message: "Credentials deleted" });
@@ -168,8 +152,6 @@ function buildApp({ secretsManager, apiKey, env = "dev" }) {
 // Test server lifecycle
 // ---------------------------------------------------------------------------
 
-const TEST_API_KEY = "test-internal-api-key-32chars!!";
-
 let server;
 let baseUrl;
 let store; // shared in-memory store, reset per-test where needed
@@ -177,7 +159,7 @@ let store; // shared in-memory store, reset per-test where needed
 before(async () => {
   store = new Map();
   const secretsManager = new InMemorySecretsManager(store);
-  const app = buildApp({ secretsManager, apiKey: TEST_API_KEY });
+  const app = buildApp({ secretsManager });
   server = createServer(app);
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const { port } = server.address();
@@ -191,30 +173,19 @@ after(async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Helper
-// ---------------------------------------------------------------------------
-
-function authHeaders(key = TEST_API_KEY) {
-  return {
-    "Content-Type": "application/json",
-    "x-internal-key": key,
-  };
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 describe("Credential CRUD routes", () => {
-  // Reset the store before each group so tests are independent
   const validKey = "bsc-credentials-testuser1";
+  const jsonHeaders = { "Content-Type": "application/json" };
 
   describe("PUT /credentials/:key", () => {
     it("should store credentials and return 200 with a valid key and body", async () => {
       store.clear();
       const res = await fetch(`${baseUrl}/credentials/${validKey}`, {
         method: "PUT",
-        headers: authHeaders(),
+        headers: jsonHeaders,
         body: JSON.stringify({ username: "seller@example.com", password: "hunter2" }),
       });
 
@@ -228,7 +199,7 @@ describe("Credential CRUD routes", () => {
     it("should return 400 when username is missing", async () => {
       const res = await fetch(`${baseUrl}/credentials/${validKey}`, {
         method: "PUT",
-        headers: authHeaders(),
+        headers: jsonHeaders,
         body: JSON.stringify({ password: "hunter2" }),
       });
 
@@ -240,7 +211,7 @@ describe("Credential CRUD routes", () => {
     it("should return 400 when password is missing", async () => {
       const res = await fetch(`${baseUrl}/credentials/${validKey}`, {
         method: "PUT",
-        headers: authHeaders(),
+        headers: jsonHeaders,
         body: JSON.stringify({ username: "seller@example.com" }),
       });
 
@@ -252,37 +223,13 @@ describe("Credential CRUD routes", () => {
     it("should return 400 when the credential key format is invalid", async () => {
       const res = await fetch(`${baseUrl}/credentials/INVALID_KEY_FORMAT`, {
         method: "PUT",
-        headers: authHeaders(),
+        headers: jsonHeaders,
         body: JSON.stringify({ username: "u", password: "p" }),
       });
 
       assert.equal(res.status, 400);
       const body = await res.json();
       assert.equal(body.error, "Invalid credential key format");
-    });
-
-    it("should return 401 without an API key", async () => {
-      const res = await fetch(`${baseUrl}/credentials/${validKey}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: "u", password: "p" }),
-      });
-
-      assert.equal(res.status, 401);
-      const body = await res.json();
-      assert.equal(body.error, "Unauthorized");
-    });
-
-    it("should return 401 with a wrong API key", async () => {
-      const res = await fetch(`${baseUrl}/credentials/${validKey}`, {
-        method: "PUT",
-        headers: authHeaders("wrong-key-value-32chars-padding!"),
-        body: JSON.stringify({ username: "u", password: "p" }),
-      });
-
-      assert.equal(res.status, 401);
-      const body = await res.json();
-      assert.equal(body.error, "Unauthorized");
     });
   });
 
@@ -296,9 +243,7 @@ describe("Credential CRUD routes", () => {
         expiresAt: 9999999999,
       });
 
-      const res = await fetch(`${baseUrl}/credentials/${validKey}/metadata`, {
-        headers: authHeaders(),
-      });
+      const res = await fetch(`${baseUrl}/credentials/${validKey}/metadata`);
 
       assert.equal(res.status, 200);
       const body = await res.json();
@@ -313,9 +258,7 @@ describe("Credential CRUD routes", () => {
       store.clear();
       store.set(validKey, { username: "seller@example.com", password: "hunter2" });
 
-      const res = await fetch(`${baseUrl}/credentials/${validKey}/metadata`, {
-        headers: authHeaders(),
-      });
+      const res = await fetch(`${baseUrl}/credentials/${validKey}/metadata`);
 
       assert.equal(res.status, 200);
       const body = await res.json();
@@ -325,9 +268,7 @@ describe("Credential CRUD routes", () => {
     it("should return 404 for a key that does not exist", async () => {
       store.clear();
 
-      const res = await fetch(`${baseUrl}/credentials/${validKey}/metadata`, {
-        headers: authHeaders(),
-      });
+      const res = await fetch(`${baseUrl}/credentials/${validKey}/metadata`);
 
       assert.equal(res.status, 404);
       const body = await res.json();
@@ -335,25 +276,11 @@ describe("Credential CRUD routes", () => {
     });
 
     it("should return 400 for an invalid key format", async () => {
-      const res = await fetch(`${baseUrl}/credentials/INVALID_FORMAT/metadata`, {
-        headers: authHeaders(),
-      });
+      const res = await fetch(`${baseUrl}/credentials/INVALID_FORMAT/metadata`);
 
       assert.equal(res.status, 400);
       const body = await res.json();
       assert.equal(body.error, "Invalid credential key format");
-    });
-
-    it("should return 401 without an API key", async () => {
-      const res = await fetch(`${baseUrl}/credentials/${validKey}/metadata`);
-      assert.equal(res.status, 401);
-    });
-
-    it("should return 401 with a wrong API key", async () => {
-      const res = await fetch(`${baseUrl}/credentials/${validKey}/metadata`, {
-        headers: { "x-internal-key": "wrong-key-value-32chars-padding!" },
-      });
-      assert.equal(res.status, 401);
     });
   });
 
@@ -364,7 +291,6 @@ describe("Credential CRUD routes", () => {
 
       const res = await fetch(`${baseUrl}/credentials/${validKey}`, {
         method: "DELETE",
-        headers: authHeaders(),
       });
 
       assert.equal(res.status, 200);
@@ -379,7 +305,6 @@ describe("Credential CRUD routes", () => {
 
       const res = await fetch(`${baseUrl}/credentials/${validKey}`, {
         method: "DELETE",
-        headers: authHeaders(),
       });
 
       // The in-memory store (like the real GCP one) treats missing-key deletes as success
@@ -389,56 +314,11 @@ describe("Credential CRUD routes", () => {
     it("should return 400 for an invalid key format", async () => {
       const res = await fetch(`${baseUrl}/credentials/INVALID_FORMAT`, {
         method: "DELETE",
-        headers: authHeaders(),
       });
 
       assert.equal(res.status, 400);
       const body = await res.json();
       assert.equal(body.error, "Invalid credential key format");
-    });
-
-    it("should return 401 without an API key", async () => {
-      const res = await fetch(`${baseUrl}/credentials/${validKey}`, {
-        method: "DELETE",
-      });
-      assert.equal(res.status, 401);
-    });
-
-    it("should return 401 with a wrong API key", async () => {
-      const res = await fetch(`${baseUrl}/credentials/${validKey}`, {
-        method: "DELETE",
-        headers: { "x-internal-key": "wrong-key-value-32chars-padding!" },
-      });
-      assert.equal(res.status, 401);
-    });
-  });
-
-  describe("Auth guard — all credential endpoints reject invalid API keys", () => {
-    const wrongKey = "wrong-key-value-32chars-padding!";
-
-    it("PUT rejects keys that differ only by one character", async () => {
-      // Tests that timingSafeEqual prevents naive string equality bypass
-      const almostRight = TEST_API_KEY.slice(0, -1) + "X";
-      const res = await fetch(`${baseUrl}/credentials/${validKey}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json", "x-internal-key": almostRight },
-        body: JSON.stringify({ username: "u", password: "p" }),
-      });
-      assert.equal(res.status, 401);
-    });
-
-    it("rejects when x-internal-key header is absent entirely", async () => {
-      const res = await fetch(`${baseUrl}/credentials/${validKey}/metadata`, {
-        headers: {},
-      });
-      assert.equal(res.status, 401);
-    });
-
-    it("rejects an empty string API key", async () => {
-      const res = await fetch(`${baseUrl}/credentials/${validKey}/metadata`, {
-        headers: { "x-internal-key": "" },
-      });
-      assert.equal(res.status, 401);
     });
   });
 });
