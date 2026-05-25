@@ -34,9 +34,12 @@ jobs:
   # PR preview path (PRs targeting main, from branches in this repo).
   #
   # Each PR gets a stable `pr-<N>` tagged revision on the dev Cloud Run
-  # service. Smoke + login-probe run against the same preview URL that a
-  # human QA's against. Traffic-serving dev (main's HEAD) is untouched.
-  # Fork PRs are skipped because they can't access WIF/OIDC secrets.
+  # service. Marketplace-login regressions are caught downstream by the
+  # neonbinder_convex Maestro E2E suite (NEO-20 IAM-gated the service so
+  # only `neonbinder-convex` can invoke it — a CI probe would need to act
+  # as Convex, which we won't allow). Traffic-serving dev (main's HEAD)
+  # is untouched. Fork PRs are skipped because they can't access
+  # WIF/OIDC secrets.
   #
   # Teardown lives in `preview-cleanup.yml` on `pull_request: closed`.
   # ---------------------------------------------------------------------------
@@ -145,47 +148,11 @@ jobs:
           SMOKE_TEST_URL: ${{ needs.deploy-preview.outputs.preview_url }}
         run: node --test tests/smoke.test.mjs
 
-  preview-login-probe:
-    needs: deploy-preview
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - run: npm ci
-
-      - uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER_DEV }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_DEPLOYER_DEV }}
-
-      - uses: google-github-actions/setup-gcloud@v2
-
-      - name: Fetch internal API key (dev)
-        run: |
-          echo "INTERNAL_API_KEY=$(gcloud secrets versions access latest --secret=internal-api-key --project=neonbinder-dev)" >> $GITHUB_ENV
-
-      - name: Run integration suite against preview
-        env:
-          TARGET_URL: ${{ needs.deploy-preview.outputs.preview_url }}
-          BSC_USERNAME: ${{ secrets.MAESTRO_BSC_USERNAME }}
-          BSC_PASSWORD: ${{ secrets.MAESTRO_BSC_PASSWORD }}
-          SPORTLOTS_USERNAME: ${{ secrets.MAESTRO_SPORTLOTS_USERNAME }}
-          SPORTLOTS_PASSWORD: ${{ secrets.MAESTRO_SPORTLOTS_PASSWORD }}
-        run: npm run test:prod-gate
-
   # Sticky PR comment with preview URL + check results. Runs regardless of
-  # whether deploy/smoke/probe succeeded so a failure still leaves a trace
-  # on the PR pointing at the workflow run.
+  # whether deploy/smoke succeeded so a failure still leaves a trace on the
+  # PR pointing at the workflow run.
   comment-preview:
-    needs: [deploy-preview, preview-smoke, preview-login-probe]
+    needs: [deploy-preview, preview-smoke]
     if: |
       always()
       && github.event_name == 'pull_request'
@@ -205,7 +172,6 @@ jobs:
           TAG: ${{ needs.deploy-preview.outputs.preview_tag }}
           DEPLOY_RESULT: ${{ needs.deploy-preview.result }}
           SMOKE_RESULT: ${{ needs.preview-smoke.result }}
-          PROBE_RESULT: ${{ needs.preview-login-probe.result }}
           REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -236,7 +202,6 @@ jobs:
           **Checks**
           - Deploy: $(status "$DEPLOY_RESULT")
           - Smoke: $(status "$SMOKE_RESULT")
-          - Login probe: $(status "$PROBE_RESULT")
 
           Preview auto-updates on each push to this PR and is torn down when the PR closes. [Workflow run]($RUN_URL)
           EOF
@@ -260,10 +225,9 @@ jobs:
   #
   #   test → build-push → deploy-dev (no_traffic + tag)
   #                              │
-  #                              ├── dev-smoke (against tagged URL)
-  #                              └── dev-login-probe (against tagged URL)
+  #                              └── dev-smoke (against tagged URL)
   #                                              │
-  #                                       (both succeed)
+  #                                       (success)
   #                                              │
   #                                       dev-promote (shift traffic to new revision)
   #                                              │
@@ -274,16 +238,18 @@ jobs:
   #                            │                                  │
   #                       deploy-prod (no_traffic + tag)     dev-rollback
   #                            │
-  #                       prod-smoke + prod-login-probe
+  #                       prod-smoke
   #                            │
   #                       prod-promote
   #
   # Build happens ONCE; the same image SHA tag flows from dev → prod. Both
-  # environments now use blue/green (no_traffic + sha tag): a new revision
-  # only gets traffic after smoke + login-probe pass against its tagged URL.
-  # The prior dev pattern (immediate traffic) caused traffic-pin drift when
-  # dev-rollback fired — every successful run now uses an explicit
-  # `update-traffic --to-revisions=NEW=100`, keeping pin state deterministic.
+  # environments use blue/green (no_traffic + sha tag): a new revision
+  # only gets traffic after smoke passes against its tagged URL.
+  # Marketplace-login regressions are caught by the convex-dev-gate Maestro
+  # suite (it exercises the full Convex → browser → BSC/SL path under real
+  # auth). Per NEO-20, only `neonbinder-convex` can invoke the Cloud Run
+  # service, so a direct probe job from CI would have to act as Convex —
+  # which we won't allow.
   # ---------------------------------------------------------------------------
 
   # Build once, push to both dev and prod GCRs. Downstream deploy jobs
@@ -352,8 +318,8 @@ jobs:
           docker push gcr.io/neonbinder/neonbinder-browser:latest
 
   # Dev deploy: blue/green — land the image at 0% traffic under a sha tag.
-  # The tagged URL is exercised by dev-smoke and dev-login-probe before
-  # dev-promote shifts traffic. Mirrors prod's pattern.
+  # The tagged URL is exercised by dev-smoke before dev-promote shifts
+  # traffic. Mirrors prod's pattern.
   deploy-dev:
     needs: build-push
     if: github.event_name == 'push'
@@ -448,52 +414,12 @@ jobs:
           SMOKE_TEST_URL: ${{ needs.deploy-dev.outputs.tagged_url }}
         run: node --test tests/smoke.test.mjs
 
-  # Real marketplace login round-trip against the tagged dev revision.
-  # Mirrors prod-login-probe and is the parallel of preview-login-probe for
-  # the post-merge lane: catches BSC/SL auth regressions before any traffic
-  # shift happens.
-  dev-login-probe:
-    needs: deploy-dev
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - run: npm ci
-
-      - uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER_DEV }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_DEPLOYER_DEV }}
-
-      - uses: google-github-actions/setup-gcloud@v2
-
-      - name: Fetch internal API key (dev)
-        run: |
-          echo "INTERNAL_API_KEY=$(gcloud secrets versions access latest --secret=internal-api-key --project=neonbinder-dev)" >> $GITHUB_ENV
-
-      - name: Run dev-gate integration suite against tagged URL
-        env:
-          TARGET_URL: ${{ needs.deploy-dev.outputs.tagged_url }}
-          BSC_USERNAME: ${{ secrets.MAESTRO_BSC_USERNAME }}
-          BSC_PASSWORD: ${{ secrets.MAESTRO_BSC_PASSWORD }}
-          SPORTLOTS_USERNAME: ${{ secrets.MAESTRO_SPORTLOTS_USERNAME }}
-          SPORTLOTS_PASSWORD: ${{ secrets.MAESTRO_SPORTLOTS_PASSWORD }}
-        run: npm run test:prod-gate
-
-  # Shifts 100% dev traffic to the new sha-tagged revision once smoke and
-  # login-probe pass. Any prior failure skips this job; the previous
-  # revision continues to serve. Pairs with prod-promote in shape, so the
-  # service-traffic state machine is now identical between environments.
+  # Shifts 100% dev traffic to the new sha-tagged revision once smoke
+  # passes. Any prior failure skips this job; the previous revision
+  # continues to serve. Pairs with prod-promote in shape, so the
+  # service-traffic state machine is identical between environments.
   dev-promote:
-    needs: [deploy-dev, dev-smoke, dev-login-probe]
+    needs: [deploy-dev, dev-smoke]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
@@ -713,49 +639,10 @@ jobs:
           SMOKE_TEST_URL: ${{ needs.deploy-prod.outputs.tagged_url }}
         run: node --test tests/smoke.test.mjs
 
-  # Real marketplace login round-trip against the prod tagged revision. This
-  # is the signal the dev gate cannot produce: can prod's env + prod Secret
-  # Manager + prod SA actually authenticate to BSC and SportLots?
-  prod-login-probe:
-    needs: deploy-prod
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - run: npm ci
-
-      - uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_DEPLOYER }}
-
-      - uses: google-github-actions/setup-gcloud@v2
-
-      - name: Fetch internal API key (prod)
-        run: |
-          echo "INTERNAL_API_KEY=$(gcloud secrets versions access latest --secret=internal-api-key --project=neonbinder)" >> $GITHUB_ENV
-
-      - name: Run prod-gate integration suite
-        env:
-          TARGET_URL: ${{ needs.deploy-prod.outputs.tagged_url }}
-          BSC_USERNAME: ${{ secrets.MAESTRO_BSC_USERNAME }}
-          BSC_PASSWORD: ${{ secrets.MAESTRO_BSC_PASSWORD }}
-          SPORTLOTS_USERNAME: ${{ secrets.MAESTRO_SPORTLOTS_USERNAME }}
-          SPORTLOTS_PASSWORD: ${{ secrets.MAESTRO_SPORTLOTS_PASSWORD }}
-        run: npm run test:prod-gate
-
   # Shifts 100% prod traffic to the new sha-tagged revision. Any prior
   # failure skips this job and the previous revision continues to serve.
   prod-promote:
-    needs: [deploy-prod, prod-smoke, prod-login-probe]
+    needs: [deploy-prod, prod-smoke]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
@@ -783,19 +670,17 @@ jobs:
   # failed. Identifies the first failed stage so the issue title points at
   # the actionable step.
   report-failure:
-    needs: [test, build-push, deploy-dev, dev-smoke, dev-login-probe, dev-promote, convex-dev-gate, dev-rollback, deploy-prod, prod-smoke, prod-login-probe, prod-promote]
+    needs: [test, build-push, deploy-dev, dev-smoke, dev-promote, convex-dev-gate, dev-rollback, deploy-prod, prod-smoke, prod-promote]
     if: |
       always() && github.event_name == 'push' && (
         needs.test.result == 'failure' ||
         needs.build-push.result == 'failure' ||
         needs.deploy-dev.result == 'failure' ||
         needs.dev-smoke.result == 'failure' ||
-        needs.dev-login-probe.result == 'failure' ||
         needs.dev-promote.result == 'failure' ||
         needs.convex-dev-gate.result == 'failure' ||
         needs.deploy-prod.result == 'failure' ||
         needs.prod-smoke.result == 'failure' ||
-        needs.prod-login-probe.result == 'failure' ||
         needs.prod-promote.result == 'failure'
       )
     runs-on: ubuntu-latest
@@ -811,13 +696,11 @@ jobs:
           R_BUILD: ${{ needs.build-push.result }}
           R_DEV: ${{ needs.deploy-dev.result }}
           R_DEV_SMOKE: ${{ needs.dev-smoke.result }}
-          R_DEV_PROBE: ${{ needs.dev-login-probe.result }}
           R_DEV_PROMOTE: ${{ needs.dev-promote.result }}
           R_GATE: ${{ needs.convex-dev-gate.result }}
           R_ROLLBACK: ${{ needs.dev-rollback.result }}
           R_PROD: ${{ needs.deploy-prod.result }}
           R_PROD_SMOKE: ${{ needs.prod-smoke.result }}
-          R_PROBE: ${{ needs.prod-login-probe.result }}
           R_PROMOTE: ${{ needs.prod-promote.result }}
           GATE_URL: ${{ needs.convex-dev-gate.outputs.e2e_run_url }}
           NEW_REV: ${{ needs.deploy-prod.outputs.new_revision }}
@@ -834,12 +717,10 @@ jobs:
           elif [ "$R_BUILD" = "failure" ]; then STAGE=build-push
           elif [ "$R_DEV" = "failure" ]; then STAGE=deploy-dev
           elif [ "$R_DEV_SMOKE" = "failure" ]; then STAGE=dev-smoke
-          elif [ "$R_DEV_PROBE" = "failure" ]; then STAGE=dev-login-probe
           elif [ "$R_DEV_PROMOTE" = "failure" ]; then STAGE=dev-promote
           elif [ "$R_GATE" = "failure" ]; then STAGE=convex-dev-gate
           elif [ "$R_PROD" = "failure" ]; then STAGE=deploy-prod
           elif [ "$R_PROD_SMOKE" = "failure" ]; then STAGE=prod-smoke
-          elif [ "$R_PROBE" = "failure" ]; then STAGE=prod-login-probe
           elif [ "$R_PROMOTE" = "failure" ]; then STAGE=prod-promote
           else STAGE=unknown
           fi
@@ -848,13 +729,13 @@ jobs:
           case "$STAGE" in
             test|build-push)
               BLAST="No infra touched. Dev and prod both still serving their previous revisions." ;;
-            deploy-dev|dev-smoke|dev-login-probe)
+            deploy-dev|dev-smoke)
               BLAST="Dev has a parked revision at 0% traffic and is still serving the previous revision (\`$DEV_PREV\`). No promote occurred. Prod never touched." ;;
             dev-promote)
               BLAST="Dev blue/green gate passed but the traffic shift call itself failed. Dev still serves \`$DEV_PREV\`. Re-run the promote job manually or investigate update-traffic errors. Prod never touched." ;;
             convex-dev-gate)
               BLAST="Dev was promoted to the new revision and then rolled back (if dev-rollback ran successfully). Prod never touched. Dev previous revision: \`$DEV_PREV\`, rollback job result: \`$R_ROLLBACK\`." ;;
-            deploy-prod|prod-smoke|prod-login-probe)
+            deploy-prod|prod-smoke)
               BLAST="Dev is serving main's HEAD. Prod has a parked revision at 0% traffic (\`$NEW_REV\`, tag \`$TAG\`) and is still serving \`$PROD_PREV\`. Tagged URL for local poking: $TAGGED_URL." ;;
             prod-promote)
               BLAST="Dev is serving main's HEAD. Prod blue/green gate passed but the traffic shift call itself failed. Re-run the promote job manually or investigate update-traffic errors." ;;
@@ -874,13 +755,11 @@ jobs:
           | build-push | \`$R_BUILD\` |
           | deploy-dev | \`$R_DEV\` |
           | dev-smoke | \`$R_DEV_SMOKE\` |
-          | dev-login-probe | \`$R_DEV_PROBE\` |
           | dev-promote | \`$R_DEV_PROMOTE\` |
           | convex-dev-gate | \`$R_GATE\` |
           | dev-rollback | \`$R_ROLLBACK\` |
           | deploy-prod | \`$R_PROD\` |
           | prod-smoke | \`$R_PROD_SMOKE\` |
-          | prod-login-probe | \`$R_PROBE\` |
           | prod-promote | \`$R_PROMOTE\` |
 
           **Links**
