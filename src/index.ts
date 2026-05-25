@@ -4,6 +4,12 @@ import helmet from "helmet";
 import { SUPPORTED_SITES } from "./adapters";
 import { BSCAdapter } from "./adapters/bsc-adapter";
 import { SportlotsAdapter } from "./adapters/sportlots-adapter";
+import {
+  getTcdbSetMetadata,
+  searchTcdbSets,
+  TcdbUnavailableError,
+  withRetry,
+} from "./adapters/tcdb-adapter";
 import { SecretsManagerService } from "./services/secrets-manager";
 
 interface LoginResponse {
@@ -254,6 +260,91 @@ app.post("/credentials/check", async (req: Request<{}, {}, { keys: string[] }>, 
     res.status(500).json({ error: "Failed to check credentials" });
   }
 });
+
+// --- TCDB enrichment endpoints (NEO-24 Stage 3) ---
+//
+// TCDB is fully public — no credentials are sent or stored. The adapter is
+// Puppeteer-only because Cloudflare blocks HTTP-only access. On Cloudflare
+// challenge or other unrecoverable failure, the route returns a soft
+// response (matches: [], reason: "tcdb-unavailable") so the Convex caller
+// can gracefully degrade — TCDB enrichment is best-effort metadata, not
+// listing-blocking.
+
+interface TcdbSearchBody {
+  sport?: unknown;
+  year?: unknown;
+  setName?: unknown;
+}
+
+app.post(
+  "/tcdb/search",
+  async (req: Request<{}, {}, TcdbSearchBody>, res: Response) => {
+    const { sport, year, setName } = req.body || {};
+    if (
+      typeof sport !== "string" ||
+      typeof setName !== "string" ||
+      !sport.trim() ||
+      !setName.trim() ||
+      typeof year !== "number" ||
+      !Number.isFinite(year) ||
+      year < 1800 ||
+      year > 2100
+    ) {
+      res.status(400).json({
+        error:
+          "Invalid request body: expected { sport: string, year: number, setName: string }",
+      });
+      return;
+    }
+    try {
+      const matches = await withRetry(
+        () => searchTcdbSets({ sport, year, setName }),
+        "searchTcdbSets",
+      );
+      res.json({ matches });
+    } catch (err) {
+      if (err instanceof TcdbUnavailableError) {
+        // Cloudflare or persistent block — surface a stable shape so callers
+        // can degrade gracefully. Not a 5xx because the service itself is fine.
+        res.json({ matches: [], reason: "tcdb-unavailable" });
+        return;
+      }
+      console.error("[TCDB] search failed:", err);
+      res.status(500).json({ error: "TCDB search failed" });
+    }
+  },
+);
+
+interface TcdbGetSetBody {
+  tcdbSetId?: unknown;
+}
+
+app.post(
+  "/tcdb/get-set",
+  async (req: Request<{}, {}, TcdbGetSetBody>, res: Response) => {
+    const { tcdbSetId } = req.body || {};
+    if (typeof tcdbSetId !== "string" || !/^\d+$/.test(tcdbSetId)) {
+      res.status(400).json({
+        error: "Invalid request body: expected { tcdbSetId: numeric string }",
+      });
+      return;
+    }
+    try {
+      const metadata = await withRetry(
+        () => getTcdbSetMetadata(tcdbSetId),
+        "getTcdbSetMetadata",
+      );
+      res.json({ metadata });
+    } catch (err) {
+      if (err instanceof TcdbUnavailableError) {
+        res.json({ metadata: null, reason: "tcdb-unavailable" });
+        return;
+      }
+      console.error("[TCDB] get-set failed:", err);
+      res.status(500).json({ error: "TCDB get-set failed" });
+    }
+  },
+);
 
 const PORT: number = parseInt(process.env.PORT || "8080", 10);
 app.listen(PORT, () => console.log(`[${ENV}] Listening on port ${PORT}`));
