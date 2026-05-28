@@ -1,6 +1,11 @@
 import { Page } from "puppeteer";
 import { BaseAdapter, AdapterResponse } from "./base-adapter";
 import { SecretsManagerService } from "../services/secrets-manager";
+import {
+  buildLoginDiagnostic,
+  LoginDiagnostic,
+  DiagnosticSecrets,
+} from "../services/login-diagnostic";
 
 interface BscSellerProfile {
   // Confirmed live from /marketplace/user/profile: `sellerId` is the
@@ -45,6 +50,56 @@ export class BSCAdapter extends BaseAdapter {
       storeName: sellerProfile.sellerStoreName,
       sellerId: sellerProfile.sellerId,
     };
+  }
+
+  /**
+   * Capture a sanitized diagnostic from the live BSC page on a login failure.
+   *
+   * Reads page.url(), page.title(), and visible body text only (innerText,
+   * never raw HTML, so inline <script> tokens never enter the snippet). Every
+   * page read is individually guarded — a page in a bad state must NEVER
+   * throw over the real login error, so on any failure we degrade to whatever
+   * we managed to read (possibly just challengeDetected:false).
+   *
+   * The returned diagnostic is redacted of the account email/password and any
+   * token/cookie-shaped material by buildLoginDiagnostic.
+   */
+  private async captureDiagnostic(
+    page: Page,
+    secrets: DiagnosticSecrets,
+  ): Promise<LoginDiagnostic | undefined> {
+    let url: string | undefined;
+    let title: string | undefined;
+    let rawText = "";
+    try {
+      url = page.url();
+    } catch {
+      /* page may be detached; omit url */
+    }
+    try {
+      title = await page.title();
+    } catch {
+      /* omit title */
+    }
+    try {
+      rawText = await page.evaluate(() => document.body?.innerText || "");
+    } catch {
+      /* omit snippet */
+    }
+    try {
+      const diagnostic = buildLoginDiagnostic({ url, title, rawText }, secrets);
+      console.log(
+        `[BSC Adapter] login-failure diagnostic: challengeDetected=${diagnostic.challengeDetected} url=${diagnostic.url ?? "(none)"}`,
+      );
+      return diagnostic;
+    } catch (error) {
+      // Building the diagnostic must never mask the real error.
+      console.error(
+        `[BSC Adapter] failed to build login diagnostic:`,
+        error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+      );
+      return undefined;
+    }
   }
 
   async login(key: string): Promise<AdapterResponse> {
@@ -216,9 +271,14 @@ export class BSCAdapter extends BaseAdapter {
       
       if (!token) {
         console.warn(`[BSC Adapter] No token found in localStorage`);
+        // No Bearer token landed in localStorage within the timeout — the
+        // page is likely showing a challenge/CAPTCHA or stuck login. Capture
+        // sanitized context so Convex/PostHog can see WHAT was on screen.
+        const diagnostic = await this.captureDiagnostic(bscPage, { email, password });
         return {
           success: false,
           error: `No Auth Token found in during login process`,
+          diagnostic,
         };
       } else {
         // Store the token and expiry in the secret manager
@@ -252,9 +312,19 @@ export class BSCAdapter extends BaseAdapter {
       
     } catch (error) {
       console.error(`[BSC Adapter] Error during login process:`, error);
+      // This is the primary failure path for the suspected bot/CAPTCHA case:
+      // the 30s waitForFunction (Bearer-token-in-localStorage) times out and
+      // throws here. Capture sanitized page context. captureDiagnostic guards
+      // every page read, so a page in a bad state can't throw over the real
+      // error; we still return the original error string below.
+      const diagnostic = await this.captureDiagnostic(bscPage, {
+        email: credentials.username,
+        password: credentials.password,
+      });
       return {
         success: false,
         error: `Error during login process: ${error}`,
+        diagnostic,
       };
     }
 
