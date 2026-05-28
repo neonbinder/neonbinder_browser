@@ -168,6 +168,32 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
+      # The probe hits the tagged revision URL (TARGET_URL), but Cloud Run
+      # validates the OIDC token's audience against the *base* service URL
+      # even for tag-prefixed hosts. Capture the base URL for the audience.
+      - id: base-url
+        name: Capture base service URL (token audience)
+        run: |
+          set -euo pipefail
+          BASE_URL=$(gcloud run services describe neonbinder-browser \
+            --region=us-central1 \
+            --project=neonbinder-dev \
+            --format='value(status.url)')
+          echo "base_url=$BASE_URL" >> $GITHUB_OUTPUT
+
+      # Mint a Google OIDC ID token as the deployer SA, scoped to the base
+      # service URL. The deployer SA holds roles/run.invoker on the service
+      # (Terraform: deployer_invoker), so Cloud Run accepts this token where
+      # an unauthenticated request returns 403.
+      - id: probe-token
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER_DEV }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_DEPLOYER_DEV }}
+          token_format: id_token
+          id_token_audience: ${{ steps.base-url.outputs.base_url }}
+          id_token_include_email: true
+
       - name: Fetch internal API key (dev)
         run: |
           echo "INTERNAL_API_KEY=$(gcloud secrets versions access latest --secret=internal-api-key --project=neonbinder-dev)" >> $GITHUB_ENV
@@ -175,6 +201,7 @@ jobs:
       - name: Run integration suite against preview
         env:
           TARGET_URL: ${{ needs.deploy-preview.outputs.preview_url }}
+          PROBE_ID_TOKEN: ${{ steps.probe-token.outputs.id_token }}
           BSC_USERNAME: ${{ secrets.MAESTRO_BSC_USERNAME }}
           BSC_PASSWORD: ${{ secrets.MAESTRO_BSC_PASSWORD }}
           SPORTLOTS_USERNAME: ${{ secrets.MAESTRO_SPORTLOTS_USERNAME }}
@@ -475,13 +502,33 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
-      - name: Fetch internal API key (dev)
+      # Cloud Run validates the OIDC audience against the base service URL even
+      # though the probe hits the tagged revision URL. Capture the base URL.
+      - id: base-url
+        name: Capture base service URL (token audience)
         run: |
-          echo "INTERNAL_API_KEY=$(gcloud secrets versions access latest --secret=internal-api-key --project=neonbinder-dev)" >> $GITHUB_ENV
+          set -euo pipefail
+          BASE_URL=$(gcloud run services describe neonbinder-browser \
+            --region=us-central1 \
+            --project=neonbinder-dev \
+            --format='value(status.url)')
+          echo "base_url=$BASE_URL" >> $GITHUB_OUTPUT
+
+      # Mint an OIDC ID token as the deployer SA (holds run.invoker via
+      # Terraform deployer_invoker), audience = base service URL.
+      - id: probe-token
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER_DEV }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_DEPLOYER_DEV }}
+          token_format: id_token
+          id_token_audience: ${{ steps.base-url.outputs.base_url }}
+          id_token_include_email: true
 
       - name: Run dev-gate integration suite against tagged URL
         env:
           TARGET_URL: ${{ needs.deploy-dev.outputs.tagged_url }}
+          PROBE_ID_TOKEN: ${{ steps.probe-token.outputs.id_token }}
           BSC_USERNAME: ${{ secrets.MAESTRO_BSC_USERNAME }}
           BSC_PASSWORD: ${{ secrets.MAESTRO_BSC_PASSWORD }}
           SPORTLOTS_USERNAME: ${{ secrets.MAESTRO_SPORTLOTS_USERNAME }}
@@ -739,13 +786,33 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
-      - name: Fetch internal API key (prod)
+      # Cloud Run validates the OIDC audience against the base service URL even
+      # though the probe hits the tagged revision URL. Capture the base URL.
+      - id: base-url
+        name: Capture base service URL (token audience)
         run: |
-          echo "INTERNAL_API_KEY=$(gcloud secrets versions access latest --secret=internal-api-key --project=neonbinder)" >> $GITHUB_ENV
+          set -euo pipefail
+          BASE_URL=$(gcloud run services describe neonbinder-browser \
+            --region=us-central1 \
+            --project=neonbinder \
+            --format='value(status.url)')
+          echo "base_url=$BASE_URL" >> $GITHUB_OUTPUT
+
+      # Mint an OIDC ID token as the prod deployer SA (holds run.invoker via
+      # Terraform deployer_invoker), audience = base service URL.
+      - id: probe-token
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_DEPLOYER }}
+          token_format: id_token
+          id_token_audience: ${{ steps.base-url.outputs.base_url }}
+          id_token_include_email: true
 
       - name: Run prod-gate integration suite
         env:
           TARGET_URL: ${{ needs.deploy-prod.outputs.tagged_url }}
+          PROBE_ID_TOKEN: ${{ steps.probe-token.outputs.id_token }}
           BSC_USERNAME: ${{ secrets.MAESTRO_BSC_USERNAME }}
           BSC_PASSWORD: ${{ secrets.MAESTRO_BSC_PASSWORD }}
           SPORTLOTS_USERNAME: ${{ secrets.MAESTRO_SPORTLOTS_USERNAME }}
