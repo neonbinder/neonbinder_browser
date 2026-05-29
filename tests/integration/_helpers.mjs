@@ -7,16 +7,33 @@
  * service over HTTP and exercise real marketplace round-trips — unlike
  * the per-adapter unit tests under `tests/*.test.mjs` which mock fetch.
  *
- * Required env:
- *   TARGET_URL          — base URL of the service (no trailing slash).
- *   INTERNAL_API_KEY    — value of the `internal-api-key` secret.
+ * NEO-20: the browser service is IAM-gated by Cloud Run — app-layer
+ * x-internal-key auth is gone (see src/index.ts). Authenticated requests
+ * carry a Google OIDC ID token in `Authorization: Bearer`. Cloud Run
+ * validates the token's audience against the *base* service URL even when
+ * the request hits a tag-prefixed revision URL, so the minted token's
+ * audience must be the base `*.run.app` service URL, not the tagged URL
+ * this suite targets. The caller (CI workflow) mints that token and passes
+ * it via PROBE_ID_TOKEN.
  *
- * Run locally:
+ * Required env:
+ *   TARGET_URL          — URL of the service/tagged revision (no trailing slash).
+ *   PROBE_ID_TOKEN      — Google OIDC ID token (audience = base service URL).
+ *                         Required only when TARGET_URL is a `*.run.app` host;
+ *                         the local `http://localhost:8080` dev path needs no auth.
+ *
+ * Run locally (no auth needed against localhost):
  *   TARGET_URL=http://localhost:8080 \
- *   INTERNAL_API_KEY=... \
  *   BSC_USERNAME=... BSC_PASSWORD=... \
  *   SPORTLOTS_USERNAME=... SPORTLOTS_PASSWORD=... \
  *   npm run test:prod-gate
+ *
+ * Run against a deployed (IAM-gated) service:
+ *   BASE_URL=https://neonbinder-browser-xxxx-uc.a.run.app
+ *   PROBE_ID_TOKEN=$(gcloud auth print-identity-token \
+ *     --impersonate-service-account=neonbinder-browser-deployer@<project>.iam.gserviceaccount.com \
+ *     --audiences="$BASE_URL")
+ *   TARGET_URL="$BASE_URL" PROBE_ID_TOKEN=$PROBE_ID_TOKEN ... npm run test:prod-gate
  */
 
 import assert from "node:assert/strict";
@@ -32,13 +49,17 @@ export function requireEnv(name) {
 }
 
 export const TARGET_URL = requireEnv("TARGET_URL").replace(/\/$/, "");
-const INTERNAL_API_KEY = requireEnv("INTERNAL_API_KEY");
+
+// Cloud Run hosts require an OIDC token; localhost dev does not. Decide once.
+const IS_CLOUD_RUN = /\.run\.app$/i.test(new URL(TARGET_URL).hostname);
+const PROBE_ID_TOKEN = IS_CLOUD_RUN ? requireEnv("PROBE_ID_TOKEN") : undefined;
 
 function authHeaders() {
-  return {
-    "Content-Type": "application/json",
-    "x-internal-key": INTERNAL_API_KEY,
-  };
+  const headers = { "Content-Type": "application/json" };
+  if (PROBE_ID_TOKEN) {
+    headers["Authorization"] = `Bearer ${PROBE_ID_TOKEN}`;
+  }
+  return headers;
 }
 
 /**
