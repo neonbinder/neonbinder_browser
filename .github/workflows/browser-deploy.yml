@@ -136,10 +136,6 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
-      - name: Fetch internal API key (dev)
-        run: |
-          echo "SMOKE_TEST_API_KEY=$(gcloud secrets versions access latest --secret=internal-api-key --project=neonbinder-dev)" >> $GITHUB_ENV
-
       - name: Run smoke tests against preview
         env:
           SMOKE_TEST_URL: ${{ needs.deploy-preview.outputs.preview_url }}
@@ -193,10 +189,6 @@ jobs:
           token_format: id_token
           id_token_audience: ${{ steps.base-url.outputs.base_url }}
           id_token_include_email: true
-
-      - name: Fetch internal API key (dev)
-        run: |
-          echo "INTERNAL_API_KEY=$(gcloud secrets versions access latest --secret=internal-api-key --project=neonbinder-dev)" >> $GITHUB_ENV
 
       - name: Run integration suite against preview
         env:
@@ -465,10 +457,6 @@ jobs:
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_DEPLOYER_DEV }}
 
       - uses: google-github-actions/setup-gcloud@v2
-
-      - name: Fetch internal API key (dev)
-        run: |
-          echo "SMOKE_TEST_API_KEY=$(gcloud secrets versions access latest --secret=internal-api-key --project=neonbinder-dev)" >> $GITHUB_ENV
 
       - name: Run smoke tests against dev tagged URL
         env:
@@ -750,10 +738,6 @@ jobs:
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_DEPLOYER }}
 
       - uses: google-github-actions/setup-gcloud@v2
-
-      - name: Fetch internal API key (prod)
-        run: |
-          echo "SMOKE_TEST_API_KEY=$(gcloud secrets versions access latest --secret=internal-api-key --project=neonbinder)" >> $GITHUB_ENV
 
       - name: Run smoke tests against prod tagged URL
         env:
