@@ -412,6 +412,13 @@ jobs:
           env_vars: ENVIRONMENT=dev
           no_traffic: true
           tag: ${{ needs.build-push.outputs.deploy_tag }}
+          # Pin warm-instance scaling on every deploy. Terraform sets minScale=1
+          # but its lifecycle ignore_changes(minScale/maxScale) means it never
+          # re-asserts; a deploy without these flags reverts minScale to 0 and
+          # the service cold-starts (30-60s Puppeteer/Chromium spin-up, and
+          # transient 401s on the Convex->/credentials call mid-cold-start).
+          # The deploy workflow is the source of truth for revision config.
+          flags: '--min-instances=1 --max-instances=20'
 
       - id: capture-new
         name: Capture new dev revision + tagged URL
@@ -696,6 +703,9 @@ jobs:
           env_vars: ENVIRONMENT=prod
           no_traffic: true
           tag: ${{ needs.build-push.outputs.deploy_tag }}
+          # See dev deploy above: pin warm-instance scaling so a deploy without
+          # these flags doesn't revert minScale to 0 (cold-starts in prod too).
+          flags: '--min-instances=1 --max-instances=20'
 
       - id: capture-new
         name: Capture new prod revision + tagged URL
