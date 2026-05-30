@@ -18,6 +18,51 @@ interface LoginResponse {
   sellerId?: string;
 }
 
+/**
+ * Emit a single structured JSON line to stdout so Cloud Run / GCP logging
+ * picks it up as a structured log entry. Used for the adapter-perf
+ * dashboard's browser-service-side timing breakdown. Never throws — falls
+ * back to a plain console.log if JSON serialization fails.
+ *
+ * Keep field names aligned with convex/observability.ts so the dashboard
+ * can union the two sources.
+ */
+function logBrowserOp(props: {
+  msg: "browser_login_call";
+  operation: string;
+  platform: "bsc" | "sportlots";
+  duration_ms: number;
+  success: boolean;
+  status_code?: number;
+  error_class?: string;
+}): void {
+  try {
+    console.log(JSON.stringify(props));
+  } catch {
+    console.log(
+      `[browser_login_call] ${props.platform} ${props.operation} ` +
+        `duration_ms=${props.duration_ms} success=${props.success}`,
+    );
+  }
+}
+
+/**
+ * Map a browser-service login error to a short stable tag for the
+ * adapter-perf dashboard. Mirrors convex/observability.ts::classifyAdapterError
+ * but covers Puppeteer-specific failure modes too.
+ */
+function classifyBrowserError(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  const s = raw.toLowerCase();
+  if (s.includes("invalid credential key")) return "bad_key_format";
+  if (s.includes("timed out") || s.includes("timeout")) return "timeout";
+  if (s.includes("invalid") && (s.includes("credential") || s.includes("password")))
+    return "invalid_credentials";
+  if (s.includes("captcha") || s.includes("challenge")) return "challenge";
+  if (s.includes("oom") || s.includes("out of memory")) return "oom";
+  return "other";
+}
+
 interface ErrorResponse {
   error: string;
   // Sanitized login-failure diagnostic (redacted of credentials/tokens by
@@ -74,8 +119,18 @@ app.get("/sites", (_req: Request, res: Response<SitesResponse>) => {
 
 // Site-specific login endpoints
 app.post("/login/sportlots", async (req: Request<{}, {}, { key: string }>, res: Response<LoginResponse | ErrorResponse>) => {
+  const startMs = Date.now();
   const { key } = req.body;
   if (!key) {
+    logBrowserOp({
+      msg: "browser_login_call",
+      operation: "login_sportlots",
+      platform: "sportlots",
+      duration_ms: Date.now() - startMs,
+      success: false,
+      status_code: 400,
+      error_class: "missing_key",
+    });
     res.status(400).json({ error: "Missing required field: key" });
     return;
   }
@@ -91,8 +146,25 @@ app.post("/login/sportlots", async (req: Request<{}, {}, { key: string }>, res: 
   try {
     const result = await adapter.login(key);
     if (result.success) {
+      logBrowserOp({
+        msg: "browser_login_call",
+        operation: "login_sportlots",
+        platform: "sportlots",
+        duration_ms: Date.now() - startMs,
+        success: true,
+        status_code: 200,
+      });
       res.json({ success: true, message: result.message });
     } else {
+      logBrowserOp({
+        msg: "browser_login_call",
+        operation: "login_sportlots",
+        platform: "sportlots",
+        duration_ms: Date.now() - startMs,
+        success: false,
+        status_code: 400,
+        error_class: classifyBrowserError(result.error),
+      });
       // Include the sanitized diagnostic (if the adapter captured one) so
       // Convex can attach it to PostHog. result.diagnostic is already
       // redacted of credentials/tokens by buildLoginDiagnostic.
@@ -103,7 +175,17 @@ app.post("/login/sportlots", async (req: Request<{}, {}, { key: string }>, res: 
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
-    if (message.includes("Invalid credential key format")) {
+    const isBadKey = message.includes("Invalid credential key format");
+    logBrowserOp({
+      msg: "browser_login_call",
+      operation: "login_sportlots",
+      platform: "sportlots",
+      duration_ms: Date.now() - startMs,
+      success: false,
+      status_code: isBadKey ? 400 : 500,
+      error_class: classifyBrowserError(message),
+    });
+    if (isBadKey) {
       res.status(400).json({ error: "Invalid credential key format" });
     } else {
       console.error("Sportlots login failed:", err);
@@ -116,8 +198,18 @@ app.post("/login/sportlots", async (req: Request<{}, {}, { key: string }>, res: 
 
 // BSC login endpoint: accepts username/password, stores in GCP, logs in via Puppeteer
 app.post("/login/bsc", async (req: Request<{}, {}, { key: string }>, res: Response<LoginResponse | ErrorResponse>) => {
+  const startMs = Date.now();
   const { key } = req.body;
   if (!key) {
+    logBrowserOp({
+      msg: "browser_login_call",
+      operation: "login_bsc",
+      platform: "bsc",
+      duration_ms: Date.now() - startMs,
+      success: false,
+      status_code: 400,
+      error_class: "missing_key",
+    });
     res.status(400).json({ error: "Missing required field: key" });
     return;
   }
@@ -133,6 +225,14 @@ app.post("/login/bsc", async (req: Request<{}, {}, { key: string }>, res: Respon
   try {
     const result = await adapter.login(key);
     if (result.success) {
+      logBrowserOp({
+        msg: "browser_login_call",
+        operation: "login_bsc",
+        platform: "bsc",
+        duration_ms: Date.now() - startMs,
+        success: true,
+        status_code: 200,
+      });
       res.json({
         success: true,
         message: result.message,
@@ -141,6 +241,15 @@ app.post("/login/bsc", async (req: Request<{}, {}, { key: string }>, res: Respon
         sellerId: result.sellerId,
       });
     } else {
+      logBrowserOp({
+        msg: "browser_login_call",
+        operation: "login_bsc",
+        platform: "bsc",
+        duration_ms: Date.now() - startMs,
+        success: false,
+        status_code: 500,
+        error_class: classifyBrowserError(result.error || result.message),
+      });
       // Include the sanitized diagnostic (if the adapter captured one) so
       // Convex can attach it to PostHog. result.diagnostic is already
       // redacted of credentials/tokens by buildLoginDiagnostic.
@@ -151,7 +260,17 @@ app.post("/login/bsc", async (req: Request<{}, {}, { key: string }>, res: Respon
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
-    if (message.includes("Invalid credential key format")) {
+    const isBadKey = message.includes("Invalid credential key format");
+    logBrowserOp({
+      msg: "browser_login_call",
+      operation: "login_bsc",
+      platform: "bsc",
+      duration_ms: Date.now() - startMs,
+      success: false,
+      status_code: isBadKey ? 400 : 500,
+      error_class: classifyBrowserError(message),
+    });
+    if (isBadKey) {
       res.status(400).json({ error: "Invalid credential key format" });
     } else {
       console.error("BSC login failed:", err);
