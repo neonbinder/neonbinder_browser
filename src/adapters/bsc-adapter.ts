@@ -1,6 +1,11 @@
 import { Page } from "puppeteer";
 import { BaseAdapter, AdapterResponse } from "./base-adapter";
 import { SecretsManagerService } from "../services/secrets-manager";
+import {
+  buildLoginDiagnostic,
+  LoginDiagnostic,
+  DiagnosticSecrets,
+} from "../services/login-diagnostic";
 
 interface BscSellerProfile {
   // Confirmed live from /marketplace/user/profile: `sellerId` is the
@@ -45,6 +50,56 @@ export class BSCAdapter extends BaseAdapter {
       storeName: sellerProfile.sellerStoreName,
       sellerId: sellerProfile.sellerId,
     };
+  }
+
+  /**
+   * Capture a sanitized diagnostic from the live BSC page on a login failure.
+   *
+   * Reads page.url(), page.title(), and visible body text only (innerText,
+   * never raw HTML, so inline <script> tokens never enter the snippet). Every
+   * page read is individually guarded — a page in a bad state must NEVER
+   * throw over the real login error, so on any failure we degrade to whatever
+   * we managed to read (possibly just challengeDetected:false).
+   *
+   * The returned diagnostic is redacted of the account email/password and any
+   * token/cookie-shaped material by buildLoginDiagnostic.
+   */
+  private async captureDiagnostic(
+    page: Page,
+    secrets: DiagnosticSecrets,
+  ): Promise<LoginDiagnostic | undefined> {
+    let url: string | undefined;
+    let title: string | undefined;
+    let rawText = "";
+    try {
+      url = page.url();
+    } catch {
+      /* page may be detached; omit url */
+    }
+    try {
+      title = await page.title();
+    } catch {
+      /* omit title */
+    }
+    try {
+      rawText = await page.evaluate(() => document.body?.innerText || "");
+    } catch {
+      /* omit snippet */
+    }
+    try {
+      const diagnostic = buildLoginDiagnostic({ url, title, rawText }, secrets);
+      console.log(
+        `[BSC Adapter] login-failure diagnostic: challengeDetected=${diagnostic.challengeDetected} url=${diagnostic.url ?? "(none)"}`,
+      );
+      return diagnostic;
+    } catch (error) {
+      // Building the diagnostic must never mask the real error.
+      console.error(
+        `[BSC Adapter] failed to build login diagnostic:`,
+        error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+      );
+      return undefined;
+    }
   }
 
   async login(key: string): Promise<AdapterResponse> {
@@ -190,18 +245,43 @@ export class BSCAdapter extends BaseAdapter {
         }
       }
 
-      // Extract token from localStorage
-      console.log(`[BSC Adapter] Extracting token from localStorage...`);
-      await bscPage.waitForFunction(() => {
-        // Look for a localStorage value containing "Bearer"
-        // @ts-ignore
-        // eslint-disable-next-line
-        return Object.values(window.localStorage).some(
-          (value) => typeof value === "string" && value.includes("Bearer")
-        );
-      }, { timeout: 30000 });
+      // After submitting credentials the page is on identity.buysportscards.com
+      // (the Azure AD B2C form) — a SEPARATE origin whose localStorage NEVER
+      // holds the BSC token. BSC completes the OAuth round-trip, redirects back
+      // to www.buysportscards.com, and only THEN (after a few seconds of
+      // hydration) renders the "Welcome Back" header and writes the Bearer
+      // token into this origin's localStorage.
+      //
+      // The previous implementation polled window.localStorage for "Bearer"
+      // immediately after clicking submit, so while the redirect was still in
+      // flight it inspected the WRONG origin's storage and burned the whole 30s
+      // budget — the real cause of the intermittent "Waiting failed: 30000ms
+      // exceeded" login failures seen under concurrent cold logins.
+      //
+      // Gate on the visible authenticated state instead: wait until we are back
+      // on the app origin AND the "Welcome Back" header has rendered. That is
+      // the truthful "login completed" signal, it follows BSC's real
+      // redirect-then-settle behaviour, and it cleanly distinguishes a genuine
+      // login failure (Welcome Back never appears) from a slow-but-successful
+      // one. Only then do we read the token — by which point it is guaranteed
+      // present in the correct origin's localStorage.
+      console.log(`[BSC Adapter] Waiting for authenticated home page after redirect...`);
+      await bscPage.waitForFunction(
+        () => {
+          // @ts-ignore
+          // eslint-disable-next-line
+          const onAppOrigin = window.location.hostname === "www.buysportscards.com";
+          // @ts-ignore
+          // eslint-disable-next-line
+          const text = (document.body && document.body.innerText) || "";
+          return onAppOrigin && /welcome back/i.test(text);
+        },
+        { timeout: 30000, polling: 500 },
+      );
+      console.log(`[BSC Adapter] Authenticated home page confirmed; extracting token from localStorage...`);
+
       const reduxAsString = await bscPage.evaluate(() => {
-        // Extract token from localStorage
+        // Extract the MSAL token from localStorage (now on the app origin).
         // @ts-ignore
         // eslint-disable-next-line
         return Object.values(window.localStorage)
@@ -213,12 +293,17 @@ export class BSCAdapter extends BaseAdapter {
       const token = redux.secret ? redux.secret.trim() : undefined;
       const expiresAt = Date.now() + (60 * 60 * 1000); // 1 hour from now in milliseconds
       console.log(`[BSC Adapter] Extracted token from localStorage.`);
-      
+
       if (!token) {
         console.warn(`[BSC Adapter] No token found in localStorage`);
+        // The authenticated header rendered but no Bearer token was in
+        // localStorage — capture sanitized context so Convex/PostHog can see
+        // WHAT was on screen.
+        const diagnostic = await this.captureDiagnostic(bscPage, { email, password });
         return {
           success: false,
           error: `No Auth Token found in during login process`,
+          diagnostic,
         };
       } else {
         // Store the token and expiry in the secret manager
@@ -252,9 +337,21 @@ export class BSCAdapter extends BaseAdapter {
       
     } catch (error) {
       console.error(`[BSC Adapter] Error during login process:`, error);
+      // Primary failure path for a stuck/blocked login: the waitForFunction
+      // above (authenticated "Welcome Back" home page after the OAuth redirect)
+      // times out and throws here — e.g. credentials rejected, a challenge/
+      // CAPTCHA, or the redirect never landing back on the app origin. Capture
+      // sanitized page context. captureDiagnostic guards every page read, so a
+      // page in a bad state can't throw over the real error; we still return
+      // the original error string below.
+      const diagnostic = await this.captureDiagnostic(bscPage, {
+        email: credentials.username,
+        password: credentials.password,
+      });
       return {
         success: false,
         error: `Error during login process: ${error}`,
+        diagnostic,
       };
     }
 

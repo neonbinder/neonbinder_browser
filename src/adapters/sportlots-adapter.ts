@@ -1,5 +1,9 @@
 import { BaseAdapter, AdapterResponse } from "./base-adapter";
 import { SecretsManagerService } from "../services/secrets-manager";
+import { buildLoginDiagnostic } from "../services/login-diagnostic";
+
+// SportLots login POST endpoint — recorded as diagnostic.url on failures.
+const SL_LOGIN_URL = "https://www.sportlots.com/cust/custbin/signin.tpl";
 
 // Retry budget for transient SportLots failures.
 // Backoffs apply BETWEEN attempts: 1→2, 2→3, 3→4, 4→5.
@@ -183,7 +187,7 @@ export class SportlotsAdapter extends BaseAdapter {
         };
       }
 
-      const loginUrl = "https://www.sportlots.com/cust/custbin/signin.tpl";
+      const loginUrl = SL_LOGIN_URL;
       const body = new URLSearchParams({
         email_val: credentials.username,
         psswd: credentials.password,
@@ -242,13 +246,21 @@ export class SportlotsAdapter extends BaseAdapter {
       if (cookies.length === 0) {
         // Most often a blank/slow body from SL; retry once. If SL genuinely
         // changed their response format we'll see it in the preview over
-        // multiple retries.
+        // multiple retries. This is also the "Not a valid Email Address"
+        // case the diagnostics work targets — build a sanitized diagnostic
+        // from the response body (redacted of the typed email/password).
         const preview = responseBody.slice(0, 200).replace(/\s+/g, " ");
         log(`no cookies parsed; body preview: ${preview}`);
+        const diagnostic = buildLoginDiagnostic(
+          { url: loginUrl, rawText: responseBody },
+          { email: credentials.username, password: credentials.password },
+        );
+        log(`no-cookies diagnostic: challengeDetected=${diagnostic.challengeDetected}`);
         return {
           success: false,
           error: "No session cookies received. Check credentials.",
           retryable: true,
+          diagnostic,
         };
       }
 
@@ -269,9 +281,15 @@ export class SportlotsAdapter extends BaseAdapter {
       if (validateBody.includes("login.tpl") || validateBody.includes("signin.tpl")) {
         const preview = validateBody.slice(0, 200).replace(/\s+/g, " ");
         log(`validation body contained login/signin reference; preview: ${preview}`);
+        const diagnostic = buildLoginDiagnostic(
+          { url: loginUrl, rawText: validateBody },
+          { email: credentials.username, password: credentials.password },
+        );
+        log(`validation-failed diagnostic: challengeDetected=${diagnostic.challengeDetected}`);
         return {
           success: false,
           error: "SportLots login validation failed. Cookies did not authenticate.",
+          diagnostic,
         };
       }
 

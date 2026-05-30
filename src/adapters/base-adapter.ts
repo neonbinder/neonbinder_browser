@@ -1,4 +1,5 @@
 import { SecretsManagerService } from "../services/secrets-manager";
+import { LoginDiagnostic } from "../services/login-diagnostic";
 import puppeteer, { Browser, Page } from "puppeteer";
 
 export interface LoginCredentials {
@@ -26,6 +27,14 @@ export interface AdapterResponse {
    * exposed in the HTTP response.
    */
   retryable?: boolean;
+  /**
+   * Sanitized login-failure diagnostic. Set by adapters on `success: false`
+   * when they could capture context from the stuck/challenge page. SAFE to
+   * return to the caller: it is redacted of credentials and tokens by
+   * buildLoginDiagnostic (see services/login-diagnostic.ts). The Convex layer
+   * forwards this onto its PostHog `credential_test_failed` event.
+   */
+  diagnostic?: LoginDiagnostic;
 }
 
 export abstract class BaseAdapter {

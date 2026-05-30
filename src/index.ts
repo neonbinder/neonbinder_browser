@@ -5,6 +5,7 @@ import { SUPPORTED_SITES } from "./adapters";
 import { BSCAdapter } from "./adapters/bsc-adapter";
 import { SportlotsAdapter } from "./adapters/sportlots-adapter";
 import { SecretsManagerService } from "./services/secrets-manager";
+import { LoginDiagnostic } from "./services/login-diagnostic";
 
 interface LoginResponse {
   success: boolean;
@@ -64,6 +65,12 @@ function classifyBrowserError(raw: string | undefined): string | undefined {
 
 interface ErrorResponse {
   error: string;
+  // Sanitized login-failure diagnostic (redacted of credentials/tokens by
+  // the adapter). Forwarded by Convex onto its PostHog
+  // `credential_test_failed` event so we can see WHAT page caused the
+  // failure (e.g. a CAPTCHA/challenge). Omitted when no diagnostic was
+  // captured.
+  diagnostic?: LoginDiagnostic;
 }
 
 interface SitesResponse {
@@ -158,7 +165,13 @@ app.post("/login/sportlots", async (req: Request<{}, {}, { key: string }>, res: 
         status_code: 400,
         error_class: classifyBrowserError(result.error),
       });
-      res.status(400).json({ error: result.error || "SportLots login failed" });
+      // Include the sanitized diagnostic (if the adapter captured one) so
+      // Convex can attach it to PostHog. result.diagnostic is already
+      // redacted of credentials/tokens by buildLoginDiagnostic.
+      res.status(400).json({
+        error: result.error || "SportLots login failed",
+        diagnostic: result.diagnostic,
+      });
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
@@ -237,7 +250,13 @@ app.post("/login/bsc", async (req: Request<{}, {}, { key: string }>, res: Respon
         status_code: 500,
         error_class: classifyBrowserError(result.error || result.message),
       });
-      res.status(500).json({ error: result.error || result.message || "BSC login failed" });
+      // Include the sanitized diagnostic (if the adapter captured one) so
+      // Convex can attach it to PostHog. result.diagnostic is already
+      // redacted of credentials/tokens by buildLoginDiagnostic.
+      res.status(500).json({
+        error: result.error || result.message || "BSC login failed",
+        diagnostic: result.diagnostic,
+      });
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
