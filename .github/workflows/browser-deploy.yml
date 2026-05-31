@@ -291,18 +291,18 @@ jobs:
   #                            ┌─────────────────┴────────────────┐
   #                        (success)                          (failure)
   #                            │                                  │
-  #                       deploy-prod (no_traffic + tag)     dev-rollback
-  #                            │
-  #                       prod-smoke + prod-login-probe
+  #                       deploy-prod (no_traffic + tag)     prod release blocked
+  #                            │                              (dev stays on HEAD;
+  #                       prod-smoke + prod-login-probe        NO dev rollback)
   #                            │
   #                       prod-promote
   #
   # Build happens ONCE; the same image SHA tag flows from dev → prod. Both
-  # environments now use blue/green (no_traffic + sha tag): a new revision
-  # only gets traffic after smoke + login-probe pass against its tagged URL.
-  # The prior dev pattern (immediate traffic) caused traffic-pin drift when
-  # dev-rollback fired — every successful run now uses an explicit
-  # `update-traffic --to-revisions=NEW=100`, keeping pin state deterministic.
+  # environments use blue/green (no_traffic + sha tag): a new revision only
+  # gets traffic after smoke + login-probe pass against its tagged URL, via an
+  # explicit `update-traffic --to-revisions=NEW=100`. Dev promotion is FINAL
+  # on browser checks (dev-smoke + dev-login-probe); the full web E2E
+  # (convex-dev-gate) gates the PROD release only — it never reverts dev.
   # ---------------------------------------------------------------------------
 
   # Build once, push to both dev and prod GCRs. Downstream deploy jobs
@@ -412,6 +412,13 @@ jobs:
           env_vars: ENVIRONMENT=dev
           no_traffic: true
           tag: ${{ needs.build-push.outputs.deploy_tag }}
+          # Pin warm-instance scaling on every deploy. Terraform sets minScale=1
+          # but its lifecycle ignore_changes(minScale/maxScale) means it never
+          # re-asserts; a deploy without these flags reverts minScale to 0 and
+          # the service cold-starts (30-60s Puppeteer/Chromium spin-up, and
+          # transient 401s on the Convex->/credentials call mid-cold-start).
+          # The deploy workflow is the source of truth for revision config.
+          flags: '--min-instances=1 --max-instances=20'
 
       - id: capture-new
         name: Capture new dev revision + tagged URL
@@ -555,8 +562,9 @@ jobs:
   # Dispatch the neonbinder_convex E2E suite against integration-test, whose
   # Vercel preview talks to dev Convex and (transitively) dev Cloud Run.
   # Runs AFTER dev-promote so the integration-test E2E exercises the new
-  # revision (live dev URL now points at it). On failure, dev-rollback
-  # shifts traffic back to the previously-serving revision.
+  # revision (live dev URL now points at it). This is the full end-user E2E
+  # gate; it gates the PROD release ONLY (see deploy-prod). On failure, dev is
+  # intentionally LEFT on the new revision — there is no dev rollback.
   convex-dev-gate:
     needs: dev-promote
     if: github.event_name == 'push'
@@ -623,35 +631,14 @@ jobs:
           echo "Timed out after 45 minutes waiting for E2E."
           exit 1
 
-  # On gate failure, roll dev traffic back to the prior revision. Prod is
-  # still-not-deployed so nothing to do there.
-  dev-rollback:
-    needs: [deploy-dev, convex-dev-gate]
-    if: always() && github.event_name == 'push' && needs.convex-dev-gate.result == 'failure' && needs.deploy-dev.outputs.prev_revision != ''
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-
-    steps:
-      - uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER_DEV }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_DEPLOYER_DEV }}
-
-      - uses: google-github-actions/setup-gcloud@v2
-
-      - name: Roll dev traffic back to ${{ needs.deploy-dev.outputs.prev_revision }}
-        run: |
-          set -euo pipefail
-          PREV="${{ needs.deploy-dev.outputs.prev_revision }}"
-          echo "Shifting 100% of traffic on neonbinder-browser (dev) back to $PREV"
-          gcloud run services update-traffic neonbinder-browser \
-            --region=us-central1 \
-            --project=neonbinder-dev \
-            --to-revisions="$PREV=100"
-          echo "Rollback complete. The broken revision stays in the revision"
-          echo "list (inactive) so we can inspect it, but serves no traffic."
+  # NOTE: there is intentionally NO dev-rollback. Dev promotion is FINAL once
+  # the browser-side gates (dev-smoke + dev-login-probe) pass — dev always
+  # tracks the latest browser code so the cross-repo web E2E (convex-dev-gate)
+  # runs against current dev. The full web E2E gates PROD ONLY (see
+  # deploy-prod's needs/if): a web-E2E failure blocks the prod release but must
+  # never revert a browser-validated dev revision. (Reverting dev on web-E2E
+  # failure previously pinned dev traffic to a month-old revision, since the
+  # stale revision then 401'd the very E2E that gated promotion — a deadlock.)
 
   # Prod deploy: blue/green — land the image from build-push at 0% traffic
   # under a sha tag; the gate jobs below exercise the tagged URL before
@@ -696,6 +683,9 @@ jobs:
           env_vars: ENVIRONMENT=prod
           no_traffic: true
           tag: ${{ needs.build-push.outputs.deploy_tag }}
+          # See dev deploy above: pin warm-instance scaling so a deploy without
+          # these flags doesn't revert minScale to 0 (cold-starts in prod too).
+          flags: '--min-instances=1 --max-instances=20'
 
       - id: capture-new
         name: Capture new prod revision + tagged URL
@@ -834,7 +824,7 @@ jobs:
   # failed. Identifies the first failed stage so the issue title points at
   # the actionable step.
   report-failure:
-    needs: [test, build-push, deploy-dev, dev-smoke, dev-login-probe, dev-promote, convex-dev-gate, dev-rollback, deploy-prod, prod-smoke, prod-login-probe, prod-promote]
+    needs: [test, build-push, deploy-dev, dev-smoke, dev-login-probe, dev-promote, convex-dev-gate, deploy-prod, prod-smoke, prod-login-probe, prod-promote]
     if: |
       always() && github.event_name == 'push' && (
         needs.test.result == 'failure' ||
@@ -865,7 +855,6 @@ jobs:
           R_DEV_PROBE: ${{ needs.dev-login-probe.result }}
           R_DEV_PROMOTE: ${{ needs.dev-promote.result }}
           R_GATE: ${{ needs.convex-dev-gate.result }}
-          R_ROLLBACK: ${{ needs.dev-rollback.result }}
           R_PROD: ${{ needs.deploy-prod.result }}
           R_PROD_SMOKE: ${{ needs.prod-smoke.result }}
           R_PROBE: ${{ needs.prod-login-probe.result }}
@@ -904,7 +893,7 @@ jobs:
             dev-promote)
               BLAST="Dev blue/green gate passed but the traffic shift call itself failed. Dev still serves \`$DEV_PREV\`. Re-run the promote job manually or investigate update-traffic errors. Prod never touched." ;;
             convex-dev-gate)
-              BLAST="Dev was promoted to the new revision and then rolled back (if dev-rollback ran successfully). Prod never touched. Dev previous revision: \`$DEV_PREV\`, rollback job result: \`$R_ROLLBACK\`." ;;
+              BLAST="The full web E2E gate failed, so the PROD release is blocked — prod was not deployed and still serves its current revision. Dev intentionally STAYS on the new (browser-validated) revision serving main's HEAD; there is no dev rollback by design. Fix the E2E failure and re-run to release prod. Gate run: $GATE_URL." ;;
             deploy-prod|prod-smoke|prod-login-probe)
               BLAST="Dev is serving main's HEAD. Prod has a parked revision at 0% traffic (\`$NEW_REV\`, tag \`$TAG\`) and is still serving \`$PROD_PREV\`. Tagged URL for local poking: $TAGGED_URL." ;;
             prod-promote)
@@ -928,7 +917,6 @@ jobs:
           | dev-login-probe | \`$R_DEV_PROBE\` |
           | dev-promote | \`$R_DEV_PROMOTE\` |
           | convex-dev-gate | \`$R_GATE\` |
-          | dev-rollback | \`$R_ROLLBACK\` |
           | deploy-prod | \`$R_PROD\` |
           | prod-smoke | \`$R_PROD_SMOKE\` |
           | prod-login-probe | \`$R_PROBE\` |
