@@ -4,6 +4,11 @@ import helmet from "helmet";
 import { SUPPORTED_SITES } from "./adapters";
 import { BSCAdapter } from "./adapters/bsc-adapter";
 import { SportlotsAdapter } from "./adapters/sportlots-adapter";
+import {
+  TcdbAdapter,
+  TcdbUnavailableError,
+  withRetry,
+} from "./adapters/tcdb-adapter";
 import { SecretsManagerService } from "./services/secrets-manager";
 import { LoginDiagnostic } from "./services/login-diagnostic";
 
@@ -28,9 +33,9 @@ interface LoginResponse {
  * can union the two sources.
  */
 function logBrowserOp(props: {
-  msg: "browser_login_call";
+  msg: "browser_login_call" | "browser_op_call";
   operation: string;
-  platform: "bsc" | "sportlots";
+  platform: "bsc" | "sportlots" | "tcdb";
   duration_ms: number;
   success: boolean;
   status_code?: number;
@@ -392,6 +397,175 @@ app.post("/credentials/check", async (req: Request<{}, {}, { keys: string[] }>, 
     res.status(500).json({ error: "Failed to check credentials" });
   }
 });
+
+// --- TCDB enrichment endpoints (NEO-38) ---
+//
+// TCDB is fully public — no credentials are sent or stored, so there is NO
+// /login/tcdb route and no Secret Manager key. The adapter is Puppeteer-only
+// because Cloudflare blocks HTTP-only access. On a Cloudflare challenge the
+// route returns a soft response ({ matches: [] | metadata: null, reason:
+// "tcdb-unavailable" }) so the Convex parallel-fetch caller can degrade
+// gracefully — TCDB enrichment is best-effort metadata, not listing-blocking.
+//
+// Both routes dispatch through a TcdbAdapter instance (uniform with the BSC/SL
+// adapters) wrapped in withRetry for transient Puppeteer flakiness, and run
+// adapter.cleanup() in a finally block to preserve the launch-paired-with-
+// cleanup invariant (a no-op for TCDB since the scraping functions own their
+// own browser lifecycle, but kept uniform across every adapter route).
+
+interface TcdbSearchBody {
+  sport?: unknown;
+  year?: unknown;
+  setName?: unknown;
+}
+
+app.post(
+  "/tcdb/search",
+  async (req: Request<{}, {}, TcdbSearchBody>, res: Response) => {
+    const startMs = Date.now();
+    const { sport, year, setName } = req.body || {};
+    if (
+      typeof sport !== "string" ||
+      typeof setName !== "string" ||
+      !sport.trim() ||
+      !setName.trim() ||
+      typeof year !== "number" ||
+      !Number.isFinite(year) ||
+      year < 1800 ||
+      year > 2100
+    ) {
+      logBrowserOp({
+        msg: "browser_op_call",
+        operation: "tcdb_search",
+        platform: "tcdb",
+        duration_ms: Date.now() - startMs,
+        success: false,
+        status_code: 400,
+        error_class: "bad_request",
+      });
+      res.status(400).json({
+        error:
+          "Invalid request body: expected { sport: string, year: number, setName: string }",
+      });
+      return;
+    }
+    const adapter = new TcdbAdapter(undefined);
+    try {
+      const matches = await withRetry(
+        () => adapter.search({ sport, year, setName }),
+        "tcdb.search",
+      );
+      logBrowserOp({
+        msg: "browser_op_call",
+        operation: "tcdb_search",
+        platform: "tcdb",
+        duration_ms: Date.now() - startMs,
+        success: true,
+        status_code: 200,
+      });
+      res.json({ matches });
+    } catch (err) {
+      if (err instanceof TcdbUnavailableError) {
+        // Cloudflare or persistent block — surface a stable shape so callers
+        // can degrade gracefully. Not a 5xx because the service itself is fine.
+        logBrowserOp({
+          msg: "browser_op_call",
+          operation: "tcdb_search",
+          platform: "tcdb",
+          duration_ms: Date.now() - startMs,
+          success: false,
+          status_code: 200,
+          error_class: "tcdb_unavailable",
+        });
+        res.json({ matches: [], reason: "tcdb-unavailable" });
+        return;
+      }
+      logBrowserOp({
+        msg: "browser_op_call",
+        operation: "tcdb_search",
+        platform: "tcdb",
+        duration_ms: Date.now() - startMs,
+        success: false,
+        status_code: 500,
+        error_class: "other",
+      });
+      console.error("[TCDB] search failed:", err);
+      res.status(500).json({ error: "TCDB search failed" });
+    } finally {
+      await adapter.cleanup();
+    }
+  },
+);
+
+interface TcdbGetSetBody {
+  tcdbSetId?: unknown;
+}
+
+app.post(
+  "/tcdb/get-set",
+  async (req: Request<{}, {}, TcdbGetSetBody>, res: Response) => {
+    const startMs = Date.now();
+    const { tcdbSetId } = req.body || {};
+    if (typeof tcdbSetId !== "string" || !/^\d+$/.test(tcdbSetId)) {
+      logBrowserOp({
+        msg: "browser_op_call",
+        operation: "tcdb_get_set",
+        platform: "tcdb",
+        duration_ms: Date.now() - startMs,
+        success: false,
+        status_code: 400,
+        error_class: "bad_request",
+      });
+      res.status(400).json({
+        error: "Invalid request body: expected { tcdbSetId: numeric string }",
+      });
+      return;
+    }
+    const adapter = new TcdbAdapter(undefined);
+    try {
+      const metadata = await withRetry(
+        () => adapter.getSet(tcdbSetId),
+        "tcdb.getSet",
+      );
+      logBrowserOp({
+        msg: "browser_op_call",
+        operation: "tcdb_get_set",
+        platform: "tcdb",
+        duration_ms: Date.now() - startMs,
+        success: true,
+        status_code: 200,
+      });
+      res.json({ metadata });
+    } catch (err) {
+      if (err instanceof TcdbUnavailableError) {
+        logBrowserOp({
+          msg: "browser_op_call",
+          operation: "tcdb_get_set",
+          platform: "tcdb",
+          duration_ms: Date.now() - startMs,
+          success: false,
+          status_code: 200,
+          error_class: "tcdb_unavailable",
+        });
+        res.json({ metadata: null, reason: "tcdb-unavailable" });
+        return;
+      }
+      logBrowserOp({
+        msg: "browser_op_call",
+        operation: "tcdb_get_set",
+        platform: "tcdb",
+        duration_ms: Date.now() - startMs,
+        success: false,
+        status_code: 500,
+        error_class: "other",
+      });
+      console.error("[TCDB] get-set failed:", err);
+      res.status(500).json({ error: "TCDB get-set failed" });
+    } finally {
+      await adapter.cleanup();
+    }
+  },
+);
 
 const PORT: number = parseInt(process.env.PORT || "8080", 10);
 app.listen(PORT, () => console.log(`[${ENV}] Listening on port ${PORT}`));
