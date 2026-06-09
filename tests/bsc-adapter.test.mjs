@@ -1,98 +1,36 @@
 /**
- * Unit tests for BSCAdapter.login
+ * Unit tests for BSCAdapter.login — browser-free Azure AD B2C flow.
  *
- * Strategy: patch SecretsManagerService and the global fetch before loading the adapter
- * from the compiled CJS dist. Puppeteer is also stubbed. Tests focus on the token-caching
- * path (which is the pure business logic) and the error branches that don't require
- * a real browser page interaction.
+ * The BSC adapter no longer uses Puppeteer for login. It replays the B2C
+ * custom-policy sign-in (B2C_1A_signin) entirely over fetch:
  *
- * The BSCAdapter.login flow:
- *   1. Call loginWithBrowser(key)
- *   2a. If cached=true: hit BSC profile API to validate the token
- *       - Valid   → return success with storeName
- *       - Invalid → clear token in SecretsManager, launchPage(), fall through
- *                   to the fresh Puppeteer login flow
- *   2b. If cached=false: a page is already launched by loginWithBrowser
+ *   1. GET  /authorize          → self-asserted HTML embedding
+ *                                 `var SETTINGS = {csrf, transId, api}`
+ *                                 + Set-Cookie: x-ms-cpim-*
+ *   2. POST /SelfAsserted       → {"status":"200"} accept / {"status":"400"} reject
+ *   3. GET  /api/<api>/confirmed → 302 Location: redirectUri#code=...
+ *   4. POST /token              → { access_token }
+ *   5. GET  /marketplace/user/profile → { sellerProfile }
+ *
+ * Strategy: patch SecretsManagerService in the require cache and stub global
+ * fetch with a router keyed on URL. No real network, no Chromium. Tests focus
+ * on: the cached-token short-circuit, the full happy-path B2C exchange, each
+ * failure branch returning a structured (non-throwing) response with a
+ * sanitized diagnostic, the cleanup() no-op invariant (no browser is ever
+ * launched), and credential non-leakage.
  *
  * Token storage convention: Secret Manager stores the BSC token *without* the
- * "Bearer " prefix. The adapter (and the Convex adapter that calls the BSC
- * REST API) prepend "Bearer " on every request. Tests use bare tokens to
- * mirror production. See bsc-adapter.ts for why every prior cache-validation
- * silently 401-ed before this convention was made explicit.
+ * "Bearer " prefix; the adapter prepends "Bearer " on the profile request.
  */
 
-import { describe, it } from "node:test";
+import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
 
 // ---------------------------------------------------------------------------
-// Module-level stubs (set up once before tests run)
-// ---------------------------------------------------------------------------
-
-// Default Puppeteer mock — drives the fresh-login flow to a successful end.
-// Tests that need to fail an early step replace `locator` or `evaluate` per-test.
-//
-// The fresh-login flow needs:
-//   1. goto(home)
-//   2. locator('button').filter(...).click() — Sign In found
-//   3. waitForSelector("#signInName")
-//   4. type("#signInName", email) + type("#password", password)
-//   5. locator('button:has-text("Next")').setTimeout(1000).click()
-//   6. waitForFunction(...) — localStorage has a "Bearer"-containing value
-//   7. evaluate(...) — returns a redux JSON string with `secret` field
-//
-// The redux blob's JSON serialization must contain both "secret" and "Bearer"
-// substrings to satisfy the .filter() and .find() in the adapter, and the
-// parsed `secret` field is what gets stored as the token (after .trim()).
-function makeMockPage(overrides = {}) {
-  const okClickable = {
-    click: async () => {},
-    setTimeout: () => ({ click: async () => {} }),
-    filter: () => ({ click: async () => {} }),
-  };
-  return {
-    goto: async () => {},
-    setViewport: async () => {},
-    waitForSelector: async () => {},
-    locator: () => okClickable,
-    type: async () => {},
-    evaluate: async () => JSON.stringify({ secret: "Bearer fresh-extracted-token" }),
-    waitForFunction: async () => {},
-    $: async () => null,
-    ...overrides,
-  };
-}
-
-const defaultMockPage = makeMockPage();
-
-const mockBrowser = {
-  newPage: async () => defaultMockPage,
-  close: async () => {},
-};
-
-function patchPuppeteer(launchImpl) {
-  const puppeteerPath = require.resolve("puppeteer");
-  const launch = launchImpl ?? (async () => mockBrowser);
-  require.cache[puppeteerPath] = {
-    id: puppeteerPath,
-    filename: puppeteerPath,
-    loaded: true,
-    exports: {
-      default: { launch },
-      launch,
-    },
-    children: [],
-    parent: null,
-    paths: [],
-  };
-}
-
-patchPuppeteer();
-
-// ---------------------------------------------------------------------------
-// Per-test helpers
+// Module loading / mocking helpers
 // ---------------------------------------------------------------------------
 
 /**
@@ -100,7 +38,6 @@ patchPuppeteer();
  * and base-adapter fresh so they pick up the new mock.
  */
 function loadBSCAdapter({ credentials, updateCredentials }) {
-  // Clear cached modules so the adapter gets the freshly-patched SecretsManagerService
   delete require.cache[require.resolve("../dist/adapters/base-adapter")];
   delete require.cache[require.resolve("../dist/adapters/bsc-adapter")];
 
@@ -122,22 +59,94 @@ function loadBSCAdapter({ credentials, updateCredentials }) {
   return BSCAdapter;
 }
 
-/**
- * Install a global fetch stub for the duration of a single test.
- * Returns a restore function.
- */
+/** Install a global fetch stub for one test. Returns a restore function. */
 function stubFetch(handler) {
   const original = globalThis.fetch;
   globalThis.fetch = handler;
   return () => { globalThis.fetch = original; };
 }
 
+/** A minimal fetch Response-like with a working getSetCookie(). */
+function makeResponse({ status = 200, ok, body = "", json, location, setCookies = [] } = {}) {
+  const headers = {
+    get: (name) => {
+      const n = name.toLowerCase();
+      if (n === "location") return location ?? null;
+      return null;
+    },
+    getSetCookie: () => setCookies,
+  };
+  return {
+    status,
+    ok: ok ?? (status >= 200 && status < 300),
+    headers,
+    text: async () => body,
+    json: async () => (json !== undefined ? json : JSON.parse(body)),
+  };
+}
+
+const SETTINGS_HTML = (overrides = {}) => {
+  const s = { csrf: "csrf-tok-abc", transId: "tx-123", api: "SelfAsserted", ...overrides };
+  return `<!doctype html><html><body><div id="api"></div><script>var SETTINGS = ${JSON.stringify(s)};</script></body></html>`;
+};
+
+/**
+ * Build a fetch router that drives the full happy-path B2C exchange. Each call
+ * is recorded so tests can assert on what was sent (including header/body
+ * leak checks). Per-step overrides let a test fail one step while leaving the
+ * rest healthy.
+ */
+function makeB2CRouter(overrides = {}) {
+  const calls = [];
+  const handler = async (url, opts = {}) => {
+    const u = String(url);
+    calls.push({ url: u, opts });
+
+    if (u.includes("/oauth2/v2.0/authorize")) {
+      if (overrides.authorize) return overrides.authorize(u, opts);
+      return makeResponse({
+        status: 200,
+        body: SETTINGS_HTML(overrides.settings),
+        setCookies: [
+          "x-ms-cpim-csrf=cookieval1; path=/; secure; httponly",
+          "x-ms-cpim-trans=cookieval2; path=/; secure; httponly",
+        ],
+      });
+    }
+    // NB: the confirmed endpoint is /api/<api>/confirmed where <api> is itself
+    // "SelfAsserted", so match /confirmed FIRST to avoid the /SelfAsserted
+    // branch swallowing it.
+    if (u.includes("/confirmed")) {
+      if (overrides.confirmed) return overrides.confirmed(u, opts);
+      return makeResponse({
+        status: 302,
+        location: "https://www.buysportscards.com/#code=auth-code-xyz&state=st",
+      });
+    }
+    if (u.includes("/SelfAsserted")) {
+      if (overrides.selfAsserted) return overrides.selfAsserted(u, opts);
+      return makeResponse({ status: 200, body: JSON.stringify({ status: "200" }) });
+    }
+    if (u.includes("/oauth2/v2.0/token")) {
+      if (overrides.token) return overrides.token(u, opts);
+      return makeResponse({ status: 200, json: { access_token: "fresh-access-token", token_type: "Bearer", expires_in: 3600 } });
+    }
+    if (u.includes("api-prod.buysportscards.com/marketplace/user/profile")) {
+      if (overrides.profile) return overrides.profile(u, opts);
+      return makeResponse({ status: 200, json: { sellerProfile: { sellerStoreName: "Fresh Store", sellerId: "fresh-login-seller" } } });
+    }
+    throw new Error(`unexpected fetch in test: ${u}`);
+  };
+  handler.calls = calls;
+  return handler;
+}
+
 // ---------------------------------------------------------------------------
-// Tests
+// Cache-hit path
 // ---------------------------------------------------------------------------
 
 describe("BSCAdapter.login — cache-hit path", () => {
-  it("returns success with storeName when cached token passes profile validation", async () => {
+  it("returns success with storeName/sellerId when the cached token passes profile validation, without any B2C calls", async () => {
     const updates = [];
     const BSCAdapter = loadBSCAdapter({
       credentials: {
@@ -149,37 +158,32 @@ describe("BSCAdapter.login — cache-hit path", () => {
       updateCredentials: (key, creds) => updates.push({ key, creds }),
     });
 
-    const restore = stubFetch(async (url, _opts) => {
-      assert.equal(new URL(url).hostname, "api-prod.buysportscards.com", "should hit BSC profile API");
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({
-          sellerProfile: { sellerStoreName: "Acme Cards", sellerId: "abcd1234efgh" },
-        }),
-      };
+    const calls = [];
+    const restore = stubFetch(async (url, opts) => {
+      calls.push(String(url));
+      assert.equal(new URL(url).hostname, "api-prod.buysportscards.com", "cache-hit should only hit the profile API");
+      return makeResponse({ status: 200, json: { sellerProfile: { sellerStoreName: "Acme Cards", sellerId: "abcd1234efgh" } } });
     });
 
     const adapter = new BSCAdapter(undefined);
-    const result = await adapter.login("bsc-credentials-seller1");
+    const result = await adapter.login("buysportscards-credentials-seller1");
     restore();
 
-    assert.equal(result.success, true, "should succeed");
-    assert.equal(result.storeName, "Acme Cards", "should include the store name from profile");
+    assert.equal(result.success, true);
+    assert.equal(result.storeName, "Acme Cards");
     assert.equal(result.sellerId, "abcd1234efgh", "should surface sellerId from profile so Convex can persist it");
-    assert.ok(result.expiresAt > Date.now(), "should return a future expiresAt");
-    assert.match(result.message, /cached token/, "message should reference cached token");
+    assert.ok(result.expiresAt > Date.now());
+    assert.match(result.message, /cached token/);
     assert.equal(updates.length, 0, "must NOT mutate the secret on a clean cache hit");
+    assert.equal(calls.length, 1, "exactly one fetch (the profile validation); no B2C exchange");
   });
 
-  it("sends the cached token with a 'Bearer ' prefix on the profile validation request (regression: bare-token 401)", async () => {
-    const receivedHeaders = {};
-
+  it("prepends 'Bearer ' to the bare cached token on the profile validation request (regression: bare-token 401)", async () => {
+    let authHeader;
     const BSCAdapter = loadBSCAdapter({
       credentials: {
         username: "seller@example.com",
         password: "secret",
-        // Stored bare, no "Bearer " prefix — same as production extraction.
         token: "raw-jwt-token-value",
         expiresAt: Date.now() + 60 * 60 * 1000,
       },
@@ -187,470 +191,342 @@ describe("BSCAdapter.login — cache-hit path", () => {
     });
 
     const restore = stubFetch(async (_url, opts) => {
-      Object.assign(receivedHeaders, opts?.headers ?? {});
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({ sellerProfile: { sellerStoreName: "Test Store" } }),
-      };
+      authHeader = (opts?.headers ?? {})["Authorization"];
+      return makeResponse({ status: 200, json: { sellerProfile: { sellerStoreName: "Test Store" } } });
     });
 
     const adapter = new BSCAdapter(undefined);
-    await adapter.login("bsc-credentials-seller1");
+    await adapter.login("buysportscards-credentials-seller1");
     restore();
 
-    assert.equal(
-      receivedHeaders["Authorization"],
-      "Bearer raw-jwt-token-value",
-      "must prepend 'Bearer ' to the bare cached token — historically every cache validation silently 401-ed without this prefix",
-    );
+    assert.equal(authHeader, "Bearer raw-jwt-token-value", "must prepend 'Bearer ' to the bare cached token");
   });
 });
 
-describe("BSCAdapter.login — cache-invalid → fresh-login path", () => {
-  it("clears the stale token and runs a fresh Puppeteer login when validation 401s", async () => {
-    const updatedCredentials = [];
+// ---------------------------------------------------------------------------
+// Cache-invalid → fresh B2C login
+// ---------------------------------------------------------------------------
+
+describe("BSCAdapter.login — cache-invalid → fresh B2C login", () => {
+  it("clears the stale token, runs the browser-free B2C exchange, and persists the fresh token", async () => {
+    const updates = [];
     const baseCreds = {
       username: "seller@example.com",
       password: "secret",
       token: "stale-bare-token",
       expiresAt: Date.now() + 60 * 60 * 1000,
     };
-
-    // Default mockPage drives the fresh-login flow to success and persists
-    // the extracted "Bearer fresh-extracted-token" via updateCredentials.
-    // Patch BEFORE loadBSCAdapter so the adapter module captures this puppeteer.
-    patchPuppeteer(async () => mockBrowser);
-
     const BSCAdapter = loadBSCAdapter({
-      credentials: () => {
-        // Initial getCredentials returns the cached creds; second call (after
-        // clear) returns username/password only. Mirrors what real Secret
-        // Manager would return after the clear-cache write.
-        const callIdx = updatedCredentials.length;
-        if (callIdx === 0) return baseCreds;
-        return { username: baseCreds.username, password: baseCreds.password };
-      },
-      updateCredentials: (key, creds) => updatedCredentials.push({ key, creds }),
+      credentials: () => (updates.length === 0 ? baseCreds : { username: baseCreds.username, password: baseCreds.password }),
+      updateCredentials: (key, creds) => updates.push({ key, creds }),
     });
 
-    // Two profile fetches now happen on this path:
-    //   1. validation of the stale cached token → 401 (triggers fresh login)
-    //   2. post-fresh-login profile fetch to capture sellerId → 200
-    // We return 401 on the first call and 200 on subsequent calls.
+    // First profile call (stale-token validation) → 401; later profile calls → 200.
     let profileCalls = 0;
-    const restore = stubFetch(async () => {
-      profileCalls++;
-      if (profileCalls === 1) {
-        return {
-          ok: false,
-          status: 401,
-          json: async () => ({ error: "Unauthorized" }),
-        };
-      }
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({
-          sellerProfile: { sellerStoreName: "Acme Cards", sellerId: "fresh-seller-id" },
-        }),
-      };
+    const router = makeB2CRouter({
+      profile: () => {
+        profileCalls++;
+        if (profileCalls === 1) return makeResponse({ status: 401, ok: false, json: { error: "Unauthorized" } });
+        return makeResponse({ status: 200, json: { sellerProfile: { sellerStoreName: "Acme Cards", sellerId: "fresh-seller-id" } } });
+      },
     });
+    const restore = stubFetch(router);
 
     const adapter = new BSCAdapter(undefined);
-    const result = await adapter.login("bsc-credentials-seller1");
+    const result = await adapter.login("buysportscards-credentials-seller1");
     restore();
 
-    assert.equal(profileCalls, 2, "should validate cached token (401), then re-fetch profile after fresh login (200)");
     assert.equal(result.success, true, "fresh login should succeed after stale-cache clear");
-    assert.equal(result.sellerId, "fresh-seller-id", "should surface sellerId captured after fresh login");
+    assert.equal(result.sellerId, "fresh-seller-id");
     assert.match(result.message, /Successfully logged into/, "message should reflect fresh login, not cached");
 
-    // First update: clearing the stale token. Second update: persisting the new token.
-    assert.equal(updatedCredentials.length, 2, "should clear stale cache, then persist fresh token");
-    const [clear, persist] = updatedCredentials;
+    // First update clears the stale token; second persists the new one.
+    assert.equal(updates.length, 2, "should clear stale cache, then persist fresh token");
+    const [clear, persist] = updates;
     assert.equal(clear.creds.token, undefined, "stale-clear update should remove token");
-    assert.equal(clear.creds.expiresAt, undefined, "stale-clear update should remove expiresAt");
+    assert.equal(clear.creds.expiresAt, undefined);
     assert.equal(clear.creds.username, "seller@example.com", "stale-clear must preserve username");
     assert.equal(clear.creds.password, "secret", "stale-clear must preserve password");
-    assert.equal(persist.creds.token, "Bearer fresh-extracted-token", "fresh login should persist the extracted token");
-    assert.ok(persist.creds.expiresAt > Date.now(), "fresh login must set a future expiresAt");
-  });
-
-  it("returns a structured failure (not an unhandled throw) when Puppeteer launch fails after a 401", async () => {
-    const updatedCredentials = [];
-
-    // Patch puppeteer BEFORE loading the adapter. The adapter modules grab
-    // their `puppeteer` reference at import time, so a later patchPuppeteer
-    // would never reach base-adapter.launchPage().
-    patchPuppeteer(async () => { throw new Error("Failed to launch Chromium"); });
-
-    const BSCAdapter = loadBSCAdapter({
-      credentials: () => {
-        if (updatedCredentials.length === 0) {
-          return {
-            username: "seller@example.com",
-            password: "secret",
-            token: "stale-bare-token",
-            expiresAt: Date.now() + 60 * 60 * 1000,
-          };
-        }
-        return { username: "seller@example.com", password: "secret" };
-      },
-      updateCredentials: (key, creds) => updatedCredentials.push({ key, creds }),
-    });
-
-    const restore = stubFetch(async () => ({
-      ok: false,
-      status: 401,
-      json: async () => ({ error: "Unauthorized" }),
-    }));
-
-    const adapter = new BSCAdapter(undefined);
-    const result = await adapter.login("bsc-credentials-seller1");
-    restore();
-
-    // Restore default puppeteer for subsequent tests.
-    patchPuppeteer();
-
-    assert.equal(result.success, false, "should return a structured failure");
-    assert.ok(result.error, "should include an error message");
-    assert.doesNotMatch(
-      result.error,
-      /No Puppeteer page available/,
-      "must NOT surface the legacy 'No Puppeteer page available for BSC login' throw — that was the symptom of the pre-fix bug",
-    );
-    assert.match(
-      result.error,
-      /Failed to launch browser/,
-      "should report a sanitized launch failure",
-    );
-
-    // The stale token must still have been cleared even though re-login failed —
-    // otherwise we'd loop on the same dead token forever.
-    assert.equal(updatedCredentials.length, 1, "should clear the stale cache before launch failed");
-    assert.equal(updatedCredentials[0].creds.token, undefined);
-    assert.equal(updatedCredentials[0].creds.expiresAt, undefined);
-  });
-});
-
-describe("BSCAdapter.login — fresh-login path (no cached token)", () => {
-  it("runs the Puppeteer flow and persists the extracted token + future expiresAt", async () => {
-    const updatedCredentials = [];
-
-    // Patch BEFORE loadBSCAdapter (see launch-failure test for why).
-    patchPuppeteer(async () => mockBrowser);
-
-    const BSCAdapter = loadBSCAdapter({
-      credentials: {
-        username: "seller@example.com",
-        password: "secret",
-        // No token / expiresAt — first-time login.
-      },
-      updateCredentials: (key, creds) => updatedCredentials.push({ key, creds }),
-    });
-
-    // The fresh-login path now performs a single profile fetch after
-    // persisting the extracted token, so we can return both storeName
-    // and sellerId in the same response shape as the cached-token path.
-    let profileCalls = 0;
-    const restore = stubFetch(async (url) => {
-      profileCalls++;
-      assert.equal(new URL(url).hostname, "api-prod.buysportscards.com", "post-login fetch should target BSC profile API");
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({
-          sellerProfile: { sellerStoreName: "Fresh Store", sellerId: "fresh-login-seller" },
-        }),
-      };
-    });
-    const beforeMs = Date.now();
-    const adapter = new BSCAdapter(undefined);
-    const result = await adapter.login("bsc-credentials-seller1");
-    const afterMs = Date.now();
-    restore();
-
-    assert.equal(profileCalls, 1, "should fetch profile exactly once after fresh login to capture sellerId");
-    assert.equal(result.success, true, "fresh login should succeed");
-    assert.equal(result.storeName, "Fresh Store", "should surface storeName from post-login profile");
-    assert.equal(result.sellerId, "fresh-login-seller", "should surface sellerId from post-login profile");
-    assert.equal(updatedCredentials.length, 1, "should persist the extracted token exactly once");
-    const persisted = updatedCredentials[0].creds;
-    assert.equal(persisted.token, "Bearer fresh-extracted-token", "should persist what evaluate() returned");
-    assert.ok(typeof persisted.expiresAt === "number", "expiresAt must be a number");
-    const oneHourMs = 60 * 60 * 1000;
-    assert.ok(
-      persisted.expiresAt >= beforeMs + oneHourMs - 5000,
-      `expiresAt should be ~1h in the future (got ${persisted.expiresAt - beforeMs}ms ahead of start)`,
-    );
-    assert.ok(
-      persisted.expiresAt <= afterMs + oneHourMs + 5000,
-      `expiresAt should be ~1h in the future (got ${persisted.expiresAt - afterMs}ms ahead of end)`,
-    );
-    assert.equal(result.expiresAt, persisted.expiresAt, "AdapterResponse.expiresAt should match what was persisted");
-  });
-
-  it("returns a failure when the Puppeteer flow can't find the Sign In button", async () => {
-    // Stub a page where every locator click throws. The adapter should catch
-    // the error and return a structured response, not crash.
-    const throwingPage = makeMockPage({
-      locator: () => ({
-        filter: () => ({ click: async () => { throw new Error("Button not found"); } }),
-        click: async () => { throw new Error("Button not found"); },
-        setTimeout: () => ({ click: async () => { throw new Error("Button not found"); } }),
-      }),
-    });
-
-    // Patch puppeteer BEFORE loading the adapter (see comment in the
-    // launch-failure test for why ordering matters).
-    patchPuppeteer(async () => ({
-      newPage: async () => throwingPage,
-      close: async () => {},
-    }));
-
-    const BSCAdapter = loadBSCAdapter({
-      credentials: { username: "seller@example.com", password: "secret" },
-      updateCredentials: null,
-    });
-
-    const adapter = new BSCAdapter(undefined);
-    const result = await adapter.login("bsc-credentials-seller1");
-
-    // Restore default puppeteer for subsequent tests.
-    patchPuppeteer();
-
-    assert.equal(result.success, false, "should return failure when Sign In flow breaks");
-    assert.ok(result.error, "should include an error message");
+    assert.equal(persist.creds.token, "fresh-access-token", "should persist the BARE access token (no 'Bearer ' prefix)");
+    assert.ok(persist.creds.expiresAt > Date.now());
   });
 });
 
 // ---------------------------------------------------------------------------
-// Cleanup invariant
+// Fresh login (no cached token)
+// ---------------------------------------------------------------------------
+
+describe("BSCAdapter.login — fresh B2C login (no cached token)", () => {
+  it("runs the full /authorize→/SelfAsserted→/confirmed→/token exchange and persists the bare token + ~1h expiry", async () => {
+    const updates = [];
+    const BSCAdapter = loadBSCAdapter({
+      credentials: { username: "seller@example.com", password: "secret" },
+      updateCredentials: (key, creds) => updates.push({ key, creds }),
+    });
+
+    const router = makeB2CRouter();
+    const restore = stubFetch(router);
+
+    const before = Date.now();
+    const adapter = new BSCAdapter(undefined);
+    const result = await adapter.login("buysportscards-credentials-seller1");
+    const after = Date.now();
+    restore();
+
+    assert.equal(result.success, true);
+    assert.equal(result.storeName, "Fresh Store");
+    assert.equal(result.sellerId, "fresh-login-seller");
+
+    // The four B2C endpoints were all hit, in order, plus the profile fetch.
+    const hosts = router.calls.map((c) => c.url);
+    assert.ok(hosts.some((u) => u.includes("/oauth2/v2.0/authorize")), "should GET /authorize");
+    assert.ok(hosts.some((u) => u.includes("/SelfAsserted")), "should POST /SelfAsserted");
+    assert.ok(hosts.some((u) => u.includes("/confirmed")), "should GET /confirmed");
+    assert.ok(hosts.some((u) => u.includes("/oauth2/v2.0/token")), "should POST /token");
+
+    assert.equal(updates.length, 1, "should persist the extracted token exactly once");
+    const persisted = updates[0].creds;
+    assert.equal(persisted.token, "fresh-access-token");
+    const oneHour = 60 * 60 * 1000;
+    assert.ok(persisted.expiresAt >= before + oneHour - 5000 && persisted.expiresAt <= after + oneHour + 5000, "expiresAt ~1h ahead");
+    assert.equal(result.expiresAt, persisted.expiresAt, "response.expiresAt should match persisted");
+  });
+
+  it("sends PKCE + the credentials to the right B2C endpoints (code_challenge on /authorize, signInName/password to /SelfAsserted, code_verifier to /token)", async () => {
+    const BSCAdapter = loadBSCAdapter({
+      credentials: { username: "seller@example.com", password: "secret" },
+      updateCredentials: null,
+    });
+    const router = makeB2CRouter();
+    const restore = stubFetch(router);
+
+    const adapter = new BSCAdapter(undefined);
+    await adapter.login("buysportscards-credentials-seller1");
+    restore();
+
+    const authorize = router.calls.find((c) => c.url.includes("/authorize"));
+    assert.ok(authorize.url.includes("code_challenge=") && authorize.url.includes("code_challenge_method=S256"), "/authorize must carry an S256 PKCE challenge");
+    assert.ok(authorize.url.includes("client_id=9b4d7d82-6b2b-4c9e-9542-d94ee43bcac1"), "/authorize must carry the BSC client_id");
+
+    const selfAsserted = router.calls.find((c) => c.url.includes("/SelfAsserted"));
+    assert.equal(selfAsserted.opts.method, "POST");
+    assert.ok(selfAsserted.opts.body.includes("signInName=seller%40example.com"), "credentials go in the SelfAsserted body");
+    assert.equal(selfAsserted.opts.headers["X-CSRF-TOKEN"], "csrf-tok-abc", "must echo the SETTINGS csrf token");
+    assert.ok(selfAsserted.opts.headers["Cookie"].includes("x-ms-cpim-csrf="), "must echo the x-ms-cpim cookies");
+
+    const token = router.calls.find((c) => c.url.includes("/oauth2/v2.0/token"));
+    assert.ok(token.opts.body.includes("code_verifier="), "/token must include the PKCE verifier");
+    assert.ok(token.opts.body.includes("grant_type=authorization_code"), "/token must use the auth-code grant");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Failure branches — must be structured (never throw), with sanitized output
+// ---------------------------------------------------------------------------
+
+describe("BSCAdapter.login — failure branches", () => {
+  it("returns a structured failure with a sanitized diagnostic when SelfAsserted rejects the credentials", async () => {
+    const updates = [];
+    const BSCAdapter = loadBSCAdapter({
+      credentials: { username: "seller@example.com", password: "hunter2" },
+      updateCredentials: (key, creds) => updates.push({ key, creds }),
+    });
+    const router = makeB2CRouter({
+      selfAsserted: () =>
+        makeResponse({ status: 200, body: JSON.stringify({ status: "400", message: "Your password is incorrect: seller@example.com / hunter2" }) }),
+    });
+    const restore = stubFetch(router);
+
+    const adapter = new BSCAdapter(undefined);
+    const result = await adapter.login("buysportscards-credentials-seller1");
+    restore();
+
+    assert.equal(result.success, false);
+    assert.equal(result.error, "Authentication failed", "caller-facing error must be generic, never the raw B2C message");
+    assert.ok(result.diagnostic, "should attach a sanitized diagnostic");
+    // Diagnostic must not leak the typed email/password that the B2C message echoed back.
+    const blob = JSON.stringify(result.diagnostic);
+    assert.doesNotMatch(blob, /seller@example\.com/, "diagnostic must redact the email");
+    assert.doesNotMatch(blob, /hunter2/, "diagnostic must redact the password");
+    assert.equal(updates.length, 0, "must NOT persist any token on an auth failure");
+    assert.ok(!router.calls.some((c) => c.url.includes("/token")), "must not reach the token endpoint after a credential rejection");
+  });
+
+  it("returns a structured failure when /authorize yields no sign-in form (missing SETTINGS)", async () => {
+    const BSCAdapter = loadBSCAdapter({
+      credentials: { username: "seller@example.com", password: "secret" },
+      updateCredentials: null,
+    });
+    const router = makeB2CRouter({
+      authorize: () => makeResponse({ status: 200, body: "<html><body>maintenance</body></html>" }),
+    });
+    const restore = stubFetch(router);
+
+    const adapter = new BSCAdapter(undefined);
+    const result = await adapter.login("buysportscards-credentials-seller1");
+    restore();
+
+    assert.equal(result.success, false);
+    assert.equal(result.error, "Authentication failed");
+    assert.ok(result.diagnostic, "should attach a diagnostic from the unexpected /authorize page");
+    assert.ok(!router.calls.some((c) => c.url.includes("/SelfAsserted")), "must not POST credentials when there is no form");
+  });
+
+  it("returns a generic failure when the token exchange fails", async () => {
+    const updates = [];
+    const BSCAdapter = loadBSCAdapter({
+      credentials: { username: "seller@example.com", password: "secret" },
+      updateCredentials: (key, creds) => updates.push({ key, creds }),
+    });
+    const router = makeB2CRouter({
+      token: () => makeResponse({ status: 400, ok: false, json: { error: "invalid_grant", error_description: "AADB2C90080 trace 1234" } }),
+    });
+    const restore = stubFetch(router);
+
+    const adapter = new BSCAdapter(undefined);
+    const result = await adapter.login("buysportscards-credentials-seller1");
+    restore();
+
+    assert.equal(result.success, false);
+    assert.equal(result.error, "Authentication failed", "must not surface the raw B2C error_description");
+    assert.equal(updates.length, 0, "no token to persist when exchange fails");
+  });
+
+  it("returns a structured failure (not a throw) when /confirmed returns no auth code", async () => {
+    const BSCAdapter = loadBSCAdapter({
+      credentials: { username: "seller@example.com", password: "secret" },
+      updateCredentials: null,
+    });
+    const router = makeB2CRouter({
+      confirmed: () => makeResponse({ status: 302, location: "https://www.buysportscards.com/#error=access_denied" }),
+    });
+    const restore = stubFetch(router);
+
+    const adapter = new BSCAdapter(undefined);
+    const result = await adapter.login("buysportscards-credentials-seller1");
+    restore();
+
+    assert.equal(result.success, false);
+    assert.equal(result.error, "Authentication failed");
+    assert.ok(!router.calls.some((c) => c.url.includes("/token")), "must not exchange when there is no code");
+  });
+
+  it("returns a generic failure (not a throw) on a network error mid-exchange", async () => {
+    const BSCAdapter = loadBSCAdapter({
+      credentials: { username: "seller@example.com", password: "secret" },
+      updateCredentials: null,
+    });
+    const restore = stubFetch(async () => { throw new Error("ECONNRESET https://identity.buysportscards.com/...?client_id=9b4d..."); });
+
+    const adapter = new BSCAdapter(undefined);
+    const result = await adapter.login("buysportscards-credentials-seller1");
+    restore();
+
+    assert.equal(result.success, false);
+    assert.equal(result.error, "Authentication failed", "network errors must not leak request URLs/params to the caller");
+  });
+
+  it("returns a structured 'Missing credentials' failure when username/password are absent", async () => {
+    const BSCAdapter = loadBSCAdapter({
+      credentials: { username: "", password: "" },
+      updateCredentials: null,
+    });
+    // No fetch should ever be made.
+    const restore = stubFetch(async (u) => { throw new Error(`unexpected fetch: ${u}`); });
+
+    const adapter = new BSCAdapter(undefined);
+    const result = await adapter.login("buysportscards-credentials-seller1");
+    restore();
+
+    assert.equal(result.success, false);
+    assert.match(result.error, /Missing credentials/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Browser-free invariant: cleanup() is always a no-op
 // ---------------------------------------------------------------------------
 //
-// Every successful launchPage() must be paired with a cleanup() call so the
-// underlying Chromium child process is killed. Without this, ~150-200 MiB
-// leaks per request and Cloud Run OOM-kills the container after ~10 logins
-// on the same instance. The 2026-05-03 dev-Cloud-Run OOM ("Memory limit of
-// 2048 MiB exceeded with 2069 MiB used") was caused by this exact leak.
-// These tests pin the invariant in code so a future refactor can't silently
-// re-introduce the regression.
+// The login path never calls launchPage(), so this.browser is never set and
+// cleanup() must be a safe no-op on every path. We assert this directly by
+// confirming cleanup() resolves without touching Puppeteer (puppeteer.launch
+// is replaced with a spy that throws if ever called).
 
-/**
- * Build an instrumented browser whose close() call is observable. Each test
- * passes its own counter object so it can assert how many times close was
- * invoked across the adapter's lifetime.
- */
-function makeInstrumentedBrowser(counter, pageOverride) {
-  return {
-    newPage: async () => pageOverride ?? defaultMockPage,
-    close: async () => {
-      counter.calls++;
-    },
-  };
-}
+describe("BSCAdapter — browser-free invariant", () => {
+  function spyPuppeteerNeverLaunches() {
+    const puppeteerPath = require.resolve("puppeteer");
+    let launched = false;
+    const launch = async () => { launched = true; throw new Error("puppeteer.launch must NOT be called by the BSC login path"); };
+    require.cache[puppeteerPath] = {
+      id: puppeteerPath, filename: puppeteerPath, loaded: true,
+      exports: { default: { launch }, launch },
+      children: [], parent: null, paths: [],
+    };
+    return () => launched;
+  }
 
-describe("BSCAdapter.cleanup — Chromium process lifecycle", () => {
-  it("closes the launched browser exactly once after a successful fresh login", async () => {
-    const counter = { calls: 0 };
-    patchPuppeteer(async () => makeInstrumentedBrowser(counter));
+  beforeEach(() => {
+    // Reset puppeteer cache so each test gets the spy below if it installs one.
+    delete require.cache[require.resolve("puppeteer")];
+  });
 
+  it("never launches a browser on a fresh login, and cleanup() is a safe no-op", async () => {
+    const wasLaunched = spyPuppeteerNeverLaunches();
     const BSCAdapter = loadBSCAdapter({
       credentials: { username: "seller@example.com", password: "secret" },
       updateCredentials: null,
     });
+    const restore = stubFetch(makeB2CRouter());
 
     const adapter = new BSCAdapter(undefined);
-    const result = await adapter.login("bsc-credentials-seller1");
-    await adapter.cleanup();
-
-    patchPuppeteer();
-
-    assert.equal(result.success, true, "fresh login should succeed");
-    assert.equal(counter.calls, 1, "browser.close() must run exactly once after a successful login");
-  });
-
-  it("still closes the launched browser when the login flow throws inside Puppeteer", async () => {
-    const counter = { calls: 0 };
-    // Page where every locator interaction throws — drives the adapter into
-    // its catch block. The Browser was still launched, so cleanup must close
-    // it; otherwise a single bad selector during a real flow leaks a
-    // Chromium process.
-    const throwingPage = makeMockPage({
-      locator: () => ({
-        filter: () => ({ click: async () => { throw new Error("Sign In not found"); } }),
-        click: async () => { throw new Error("Sign In not found"); },
-        setTimeout: () => ({ click: async () => { throw new Error("Sign In not found"); } }),
-      }),
-    });
-    patchPuppeteer(async () => makeInstrumentedBrowser(counter, throwingPage));
-
-    const BSCAdapter = loadBSCAdapter({
-      credentials: { username: "seller@example.com", password: "secret" },
-      updateCredentials: null,
-    });
-
-    const adapter = new BSCAdapter(undefined);
-    const result = await adapter.login("bsc-credentials-seller1");
-    await adapter.cleanup();
-
-    patchPuppeteer();
-
-    assert.equal(result.success, false, "broken login should return a structured failure");
-    assert.equal(counter.calls, 1, "browser.close() must still run when the login flow fails inside Puppeteer");
-  });
-
-  it("is a no-op on the cache-hit path — no browser was launched, so close() is never called", async () => {
-    const counter = { calls: 0 };
-    // Patch puppeteer with an instrumented browser; if the adapter ever
-    // launches one on a cache hit, this counter will catch it.
-    patchPuppeteer(async () => makeInstrumentedBrowser(counter));
-
-    const BSCAdapter = loadBSCAdapter({
-      credentials: {
-        username: "seller@example.com",
-        password: "secret",
-        token: "valid-cached-token",
-        expiresAt: Date.now() + 60 * 60 * 1000,
-      },
-      updateCredentials: null,
-    });
-
-    const restore = stubFetch(async () => ({
-      ok: true,
-      status: 200,
-      json: async () => ({ sellerProfile: { sellerStoreName: "Acme Cards" } }),
-    }));
-
-    const adapter = new BSCAdapter(undefined);
-    const result = await adapter.login("bsc-credentials-seller1");
-    // cleanup() must be safe to call even though no browser was launched.
-    await adapter.cleanup();
+    const result = await adapter.login("buysportscards-credentials-seller1");
+    await assert.doesNotReject(adapter.cleanup(), "cleanup() must be a no-op when no browser was launched");
     restore();
 
-    patchPuppeteer();
-
-    assert.equal(result.success, true, "cache-hit path should succeed");
-    assert.match(result.message, /cached token/, "should be the cached path, not fresh");
-    assert.equal(counter.calls, 0, "no browser was launched, so cleanup must not invoke close()");
+    assert.equal(result.success, true);
+    assert.equal(wasLaunched(), false, "the login path must never launch Chromium");
   });
 
-  it("closes the freshly-launched browser on the cache-invalid → fresh-login fallthrough path", async () => {
-    const counter = { calls: 0 };
-    patchPuppeteer(async () => makeInstrumentedBrowser(counter));
-
-    const updatedCredentials = [];
+  it("never launches a browser on the cache-invalid → fresh-login fallthrough, and cleanup() is a no-op", async () => {
+    const wasLaunched = spyPuppeteerNeverLaunches();
+    const updates = [];
     const BSCAdapter = loadBSCAdapter({
-      credentials: () => {
-        if (updatedCredentials.length === 0) {
-          return {
-            username: "seller@example.com",
-            password: "secret",
-            token: "stale-bare-token",
-            expiresAt: Date.now() + 60 * 60 * 1000,
-          };
-        }
-        return { username: "seller@example.com", password: "secret" };
-      },
-      updateCredentials: (key, creds) => updatedCredentials.push({ key, creds }),
+      credentials: () =>
+        updates.length === 0
+          ? { username: "seller@example.com", password: "secret", token: "stale", expiresAt: Date.now() + 3600_000 }
+          : { username: "seller@example.com", password: "secret" },
+      updateCredentials: (k, c) => updates.push({ k, c }),
     });
-
-    // Profile-validation 401 → adapter clears the cache and falls through to
-    // launchPage() inside login(). That launchPage() is the OOM-prone path
-    // that the original bug never closed.
-    const restore = stubFetch(async () => ({
-      ok: false,
-      status: 401,
-      json: async () => ({ error: "Unauthorized" }),
+    let profileCalls = 0;
+    const restore = stubFetch(makeB2CRouter({
+      profile: () => {
+        profileCalls++;
+        return profileCalls === 1
+          ? makeResponse({ status: 401, ok: false, json: { error: "Unauthorized" } })
+          : makeResponse({ status: 200, json: { sellerProfile: { sellerStoreName: "S", sellerId: "id" } } });
+      },
     }));
 
     const adapter = new BSCAdapter(undefined);
-    const result = await adapter.login("bsc-credentials-seller1");
-    await adapter.cleanup();
+    const result = await adapter.login("buysportscards-credentials-seller1");
+    await assert.doesNotReject(adapter.cleanup());
     restore();
 
-    patchPuppeteer();
-
-    assert.equal(result.success, true, "fallthrough fresh login should succeed");
-    assert.equal(counter.calls, 1, "the freshly-launched browser on the fallthrough path must be closed");
+    assert.equal(result.success, true);
+    assert.equal(wasLaunched(), false, "even the stale-token fallthrough must never launch Chromium");
   });
 
-  it("is idempotent: calling cleanup() twice does not re-close the browser or throw", async () => {
-    const counter = { calls: 0 };
-    patchPuppeteer(async () => makeInstrumentedBrowser(counter));
-
+  it("cleanup() is idempotent and never throws", async () => {
+    spyPuppeteerNeverLaunches();
     const BSCAdapter = loadBSCAdapter({
       credentials: { username: "seller@example.com", password: "secret" },
       updateCredentials: null,
     });
-
+    const restore = stubFetch(makeB2CRouter());
     const adapter = new BSCAdapter(undefined);
-    await adapter.login("bsc-credentials-seller1");
+    await adapter.login("buysportscards-credentials-seller1");
     await adapter.cleanup();
-    await adapter.cleanup(); // second call must be a no-op
-
-    patchPuppeteer();
-
-    assert.equal(counter.calls, 1, "cleanup() must be idempotent — second call is a no-op");
-  });
-
-  it("swallows errors from browser.close() so cleanup-in-finally never masks the original error", async () => {
-    // browser.close() throwing during cleanup is plausible if the Cloud Run
-    // worker is being preempted. We must not let that bubble out of cleanup
-    // and overwrite the real login result the route handler is about to
-    // return to the caller.
-    const counter = { calls: 0 };
-    patchPuppeteer(async () => ({
-      newPage: async () => defaultMockPage,
-      close: async () => {
-        counter.calls++;
-        throw new Error("Browser already disconnected");
-      },
-    }));
-
-    const BSCAdapter = loadBSCAdapter({
-      credentials: { username: "seller@example.com", password: "secret" },
-      updateCredentials: null,
-    });
-
-    const adapter = new BSCAdapter(undefined);
-    await adapter.login("bsc-credentials-seller1");
-
-    // If cleanup re-throws, this assertion is what fails — it must not.
-    await assert.doesNotReject(
-      adapter.cleanup(),
-      "cleanup() must catch errors from browser.close() so try/finally in route handlers never masks the real error",
-    );
-
-    patchPuppeteer();
-
-    assert.equal(counter.calls, 1, "browser.close() should still have been attempted exactly once");
-  });
-
-  it("closes a separate browser per login when the same adapter instance is reused for multiple sequential logins", async () => {
-    // Real route handlers create a new adapter per request, but defending
-    // the invariant against accidental reuse is cheap and rules out a class
-    // of leaks where a test or future refactor reuses an adapter without
-    // realizing each login() launches a fresh browser.
-    const counter = { calls: 0 };
-    patchPuppeteer(async () => makeInstrumentedBrowser(counter));
-
-    const BSCAdapter = loadBSCAdapter({
-      credentials: { username: "seller@example.com", password: "secret" },
-      updateCredentials: null,
-    });
-
-    const adapter = new BSCAdapter(undefined);
-    await adapter.login("bsc-credentials-seller1");
-    await adapter.cleanup();
-    await adapter.login("bsc-credentials-seller1");
-    await adapter.cleanup();
-    await adapter.login("bsc-credentials-seller1");
-    await adapter.cleanup();
-
-    patchPuppeteer();
-
-    assert.equal(counter.calls, 3, "each sequential login on the same adapter must launch+close its own browser — no orphan processes");
+    await assert.doesNotReject(adapter.cleanup(), "second cleanup() must be a no-op");
+    restore();
   });
 });
