@@ -444,6 +444,147 @@ describe("BSCAdapter.login — failure branches", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Diagnostic sanitization: script/style stripping (CodeQL js/bad-tag-filter)
+// ---------------------------------------------------------------------------
+//
+// When /authorize returns a page with no sign-in form, the adapter strips the
+// HTML (stripTags) and feeds the visible-text approximation to
+// buildLoginDiagnostic for the snippet. stripTags MUST remove <script>/<style>
+// block CONTENT so inline token material never reaches the diagnostic — even
+// when the end tag uses a non-canonical spelling (trailing whitespace/newline,
+// bogus attributes, or an unterminated block running to EOF). A naive
+// `</script>` filter misses `</script >` / `</style\n>` (the bypass CodeQL's
+// js/bad-tag-filter flags), letting the script body slip through.
+//
+// We exercise the real stripTags via the public login() "no form" branch and
+// assert the secret CONTENT does not survive in result.diagnostic.
+//
+// CRITICAL test-design note: buildLoginDiagnostic ALSO value-redacts the typed
+// email/password (case-insensitively) from the snippet. If a marker shared a
+// substring with the mock credentials, that redaction — not stripTags — could
+// mask it and give a false pass (an early draft of this test used the literal
+// "SECRET..." with a "secret" password and passed against the OLD vulnerable
+// regex for exactly that reason). So the markers below ("LEAKCANARY*") share NO
+// substring with the credentials, and the credentials themselves contain no
+// "leak"/"canary" fragment. Their absence therefore proves stripTags removed
+// the whole <script>/<style> block, not that value-redaction masked the leak.
+
+describe("BSCAdapter — diagnostic script/style stripping (CodeQL js/bad-tag-filter)", () => {
+  const CREDS = { username: "vendor99@example.com", password: "p@ssw0rd-9z!" };
+
+  async function diagnosticForAuthorizeBody(body) {
+    const BSCAdapter = loadBSCAdapter({ credentials: CREDS, updateCredentials: null });
+    // Authorize returns a page with NO SETTINGS form → adapter strips HTML and
+    // builds a diagnostic from the result; no further B2C calls should happen.
+    const router = makeB2CRouter({
+      authorize: () => makeResponse({ status: 200, body }),
+    });
+    const restore = stubFetch(router);
+    const adapter = new BSCAdapter(undefined);
+    const result = await adapter.login("buysportscards-credentials-seller1");
+    restore();
+    assert.equal(result.success, false);
+    assert.ok(result.diagnostic, "no-form branch must attach a diagnostic");
+    assert.ok(
+      !router.calls.some((c) => c.url.includes("/SelfAsserted")),
+      "must not POST credentials when there is no sign-in form",
+    );
+    return result.diagnostic;
+  }
+
+  /** Guard: a marker must not be redactable by credential value (else a pass is meaningless). */
+  function assertNotCredentialDerived(marker) {
+    const lc = marker.toLowerCase();
+    for (const v of [CREDS.username, CREDS.password]) {
+      assert.ok(
+        !lc.includes(v.toLowerCase()),
+        `marker "${marker}" must not contain a credential value, or value-redaction (not stripTags) could mask it`,
+      );
+    }
+  }
+
+  it("drops <script> content even when the end tag has trailing whitespace (</script >)", async () => {
+    const MARKER = "LEAKCANARY_TRAILING_SPACE";
+    assertNotCredentialDerived(MARKER);
+    const diagnostic = await diagnosticForAuthorizeBody(
+      `<html><body>down for maintenance<script>var t='${MARKER}';</script ></body></html>`,
+    );
+    assert.doesNotMatch(
+      JSON.stringify(diagnostic),
+      new RegExp(MARKER),
+      "script body must not survive a '</script >' end tag",
+    );
+  });
+
+  it("drops <script> content when the end tag has a newline before '>' (</script\\n>)", async () => {
+    const MARKER = "LEAKCANARY_NEWLINE";
+    assertNotCredentialDerived(MARKER);
+    const diagnostic = await diagnosticForAuthorizeBody(
+      `<html><body>maintenance<script>var t='${MARKER}';</script\n></body></html>`,
+    );
+    assert.doesNotMatch(
+      JSON.stringify(diagnostic),
+      new RegExp(MARKER),
+      "script body must not survive a '</script\\n>' end tag",
+    );
+  });
+
+  it("drops <script> content when the end tag carries bogus attributes (</script foo>)", async () => {
+    const MARKER = "LEAKCANARY_BOGUS_ATTR";
+    assertNotCredentialDerived(MARKER);
+    const diagnostic = await diagnosticForAuthorizeBody(
+      `<html><body>maintenance<script>var t='${MARKER}';</script foo="bar"></body></html>`,
+    );
+    assert.doesNotMatch(
+      JSON.stringify(diagnostic),
+      new RegExp(MARKER),
+      "script body must not survive a '</script foo>' end tag",
+    );
+  });
+
+  it("drops <style> content when the end tag has a newline before '>' (</style\\n>)", async () => {
+    const MARKER = "LEAKCANARY_STYLE_NEWLINE";
+    assertNotCredentialDerived(MARKER);
+    const diagnostic = await diagnosticForAuthorizeBody(
+      `<html><head><style>.x{background:url(${MARKER})}</style\n></head><body>maintenance</body></html>`,
+    );
+    assert.doesNotMatch(
+      JSON.stringify(diagnostic),
+      new RegExp(MARKER),
+      "style body must not survive a '</style\\n>' end tag",
+    );
+  });
+
+  it("drops an unterminated <script> block that runs to end-of-input", async () => {
+    const MARKER = "LEAKCANARY_EOF";
+    assertNotCredentialDerived(MARKER);
+    const diagnostic = await diagnosticForAuthorizeBody(
+      `<html><body>maintenance<script>var t='${MARKER}';`,
+    );
+    assert.doesNotMatch(
+      JSON.stringify(diagnostic),
+      new RegExp(MARKER),
+      "an unterminated script block must be dropped, not left in the snippet",
+    );
+  });
+
+  it("preserves surrounding visible text while stripping the script block", async () => {
+    const MARKER = "LEAKCANARY_KEEP_TEXT";
+    assertNotCredentialDerived(MARKER);
+    const diagnostic = await diagnosticForAuthorizeBody(
+      `<html><body>VISIBLE_MAINTENANCE_TEXT<script>var t='${MARKER}';</script ></body></html>`,
+    );
+    const blob = JSON.stringify(diagnostic);
+    assert.doesNotMatch(blob, new RegExp(MARKER), "script body must be removed");
+    assert.match(
+      blob,
+      /VISIBLE_MAINTENANCE_TEXT/,
+      "visible page text should still reach the diagnostic snippet",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Browser-free invariant: cleanup() is always a no-op
 // ---------------------------------------------------------------------------
 //

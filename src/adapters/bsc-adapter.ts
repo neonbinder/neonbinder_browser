@@ -396,12 +396,23 @@ export class BSCAdapter extends BaseAdapter {
    * buildLoginDiagnostic expects innerText-style input (not raw HTML) so that
    * inline <script> token material never reaches the snippet; this gives a
    * close-enough approximation for a fetch'd page where we have no DOM.
+   *
+   * Security note (CodeQL js/bad-tag-filter): the <script>/<style> block
+   * removal must tolerate every well-known end-tag spelling, or inline token
+   * material slips past the filter and into the diagnostic snippet. The end-tag
+   * sub-pattern `<\/script[^>]*>` matches any chars up to the first '>', so it
+   * accepts trailing whitespace/newlines and bogus attributes before the close
+   * (`</script >`, `</script\n>`, `</script foo="bar">`) — the exact bypasses
+   * js/bad-tag-filter flags. The `(?:<\/script[^>]*>|$)` alternation also drops
+   * an unterminated block running to EOF (a truncated/maintenance page) rather
+   * than leaving its body in the output. The trailing `<[^>]*>` sweep then
+   * removes any remaining ordinary tags.
    */
   private stripTags(html: string): string {
     return html
-      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
-      .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
-      .replace(/<[^>]+>/g, " ");
+      .replace(/<script\b[^>]*>[\s\S]*?(?:<\/script[^>]*>|$)/gi, " ")
+      .replace(/<style\b[^>]*>[\s\S]*?(?:<\/style[^>]*>|$)/gi, " ")
+      .replace(/<[^>]*>/g, " ");
   }
 
   async login(key: string): Promise<AdapterResponse> {
