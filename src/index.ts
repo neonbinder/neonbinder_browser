@@ -6,6 +6,7 @@ import { BSCAdapter } from "./adapters/bsc-adapter";
 import { SportlotsAdapter } from "./adapters/sportlots-adapter";
 import { SecretsManagerService } from "./services/secrets-manager";
 import { LoginDiagnostic } from "./services/login-diagnostic";
+import { credentialRateLimitKey } from "./rate-limit";
 
 interface LoginResponse {
   success: boolean;
@@ -89,12 +90,18 @@ if (ENV !== "dev") {
 app.use(helmet());
 app.use(express.json({ limit: "10kb" }));
 
-// Rate limiting
+// Rate limiting — keyed PER CREDENTIAL KEY (≈ per user+site), NOT per IP.
+// See credentialRateLimitKey (./rate-limit) for the full why: Cloud Run IAM
+// gates callers to the neonbinder-convex SA, so every request shares that one
+// backend's egress IP — an IP-keyed limit was a single global budget that
+// parallel users / E2E workers 429'd each other on, silently dropping the
+// credential seeds (PUT /credentials) and poisoning the parallel suite.
 const limiter = rateLimit({
-  windowMs: 60 * 1000,  // 1 minute
-  max: 30,               // 30 requests per minute
+  windowMs: 60 * 1000, // 1 minute
+  max: 60, // per credential key — ample for one user+site, still catches a runaway loop
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: credentialRateLimitKey,
   validate: ENV === "dev" ? { xForwardedForHeader: false, trustProxy: false } : true,
 });
 app.use(limiter);
