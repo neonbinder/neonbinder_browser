@@ -322,3 +322,131 @@ describe("Credential CRUD routes", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Rate limiting — per credential key (isolation)
+// ---------------------------------------------------------------------------
+//
+// Regression guard for the NEO-47 fix. The limiter must bucket by CREDENTIAL
+// KEY, not by IP: every request reaches the service from Convex's single egress
+// IP (Cloud Run IAM is the auth gate), so an IP-keyed limit was ONE global
+// budget that parallel users / E2E workers 429'd each other on — silently
+// dropping credential seeds. This exercises the REAL keyGenerator shipped in
+// dist/rate-limit, so a regression back to IP-keying fails the suite (a mirror
+// copied into this test would not catch that).
+
+describe("Rate limiting — per credential key (isolation)", () => {
+  const { credentialRateLimitKey } = require("../dist/rate-limit");
+  const MAX = 3; // tiny budget so we can exhaust a single key cheaply
+  let rlServer;
+  let rlBase;
+
+  before(async () => {
+    const express = require("express");
+    const rateLimit = require("express-rate-limit");
+    const app = express();
+    app.use(express.json({ limit: "10kb" }));
+    app.use(
+      rateLimit({
+        windowMs: 60 * 1000,
+        max: MAX,
+        standardHeaders: true,
+        legacyHeaders: false,
+        keyGenerator: credentialRateLimitKey, // the real, shipped key function
+        validate: { xForwardedForHeader: false, trustProxy: false },
+      }),
+    );
+    // Mirrors the real PUT /credentials/:key surface (credential key in the URL).
+    app.put("/credentials/:key", (_req, res) => res.json({ ok: true }));
+    rlServer = createServer(app);
+    await new Promise((resolve) => rlServer.listen(0, "127.0.0.1", resolve));
+    rlBase = `http://127.0.0.1:${rlServer.address().port}`;
+  });
+
+  after(async () => {
+    await new Promise((resolve, reject) =>
+      rlServer.close((err) => (err ? reject(err) : resolve())),
+    );
+  });
+
+  const putKey = (key) =>
+    fetch(`${rlBase}/credentials/${key}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "u", password: "p" }),
+    });
+
+  it("buckets by the URL path :key (limiter runs before route params exist)", () => {
+    // The limiter is global middleware; req.params is empty pre-routing, so the
+    // key MUST come from req.path for the URL-keyed routes — including the seed
+    // write PUT /credentials/:key whose 429s started this.
+    assert.equal(
+      credentialRateLimitKey({ path: "/credentials/bsc-credentials-userA", body: {} }),
+      "cred:bsc-credentials-userA",
+      "PUT/DELETE /credentials/:key — path :key should drive the bucket",
+    );
+    assert.equal(
+      credentialRateLimitKey({ path: "/credentials/bsc-credentials-userA/metadata", body: {} }),
+      "cred:bsc-credentials-userA",
+      "GET /credentials/:key/metadata — trailing sub-resource must not change the bucket",
+    );
+    assert.equal(
+      credentialRateLimitKey({ path: "/credentials/bsc-credentials-userA/token", body: {} }),
+      "cred:bsc-credentials-userA",
+      "GET /credentials/:key/token — same per-key bucket",
+    );
+  });
+
+  it("buckets by the request body for the body-keyed routes", () => {
+    assert.equal(
+      credentialRateLimitKey({ path: "/login/sportlots", body: { key: "sportlots-credentials-userB" } }),
+      "cred:sportlots-credentials-userB",
+      "POST /login/* — body.key should drive the bucket",
+    );
+    // /credentials/check is the one /credentials/* route that is body-keyed:
+    // the literal "check" segment must NOT be mistaken for a credential key.
+    assert.equal(
+      credentialRateLimitKey({ path: "/credentials/check", body: { keys: ["bsc-credentials-userC"] } }),
+      "cred:bsc-credentials-userC",
+      "POST /credentials/check — body.keys[0], never the 'check' path segment",
+    );
+  });
+
+  it("distinct credential keys map to distinct buckets (the isolation invariant)", () => {
+    assert.notEqual(
+      credentialRateLimitKey({ path: "/credentials/bsc-credentials-userA", body: {} }),
+      credentialRateLimitKey({ path: "/credentials/bsc-credentials-userB", body: {} }),
+      "two users must not share a rate-limit budget",
+    );
+  });
+
+  it("falls back to a normalized IP only when no credential key is present", () => {
+    const k = credentialRateLimitKey({ path: "/health", body: {}, ip: "203.0.113.7" });
+    assert.equal(typeof k, "string");
+    assert.ok(!k.startsWith("cred:"), "keyless requests must NOT use a cred: bucket");
+    assert.ok(k.length > 0, "keyless requests must still produce a bucket (the IP)");
+  });
+
+  it("exhausting one credential key's budget does NOT 429 a different key", async () => {
+    const keyA = "bsc-credentials-userA";
+    const keyB = "bsc-credentials-userB";
+
+    // Drain key A's entire budget — all MAX requests are under the limit.
+    for (let i = 0; i < MAX; i++) {
+      const res = await putKey(keyA);
+      assert.equal(res.status, 200, `key A request ${i + 1}/${MAX} should be allowed`);
+    }
+    // The next request for key A is over budget → 429.
+    const overA = await putKey(keyA);
+    assert.equal(overA.status, 429, "key A should be limited after exhausting its budget");
+
+    // A DIFFERENT credential key still has its own full budget → NOT limited.
+    // This is the whole point of the fix: one user can't 429 another.
+    const firstB = await putKey(keyB);
+    assert.equal(
+      firstB.status,
+      200,
+      "key B must be unaffected by key A's exhausted budget (per-key isolation)",
+    );
+  });
+});
