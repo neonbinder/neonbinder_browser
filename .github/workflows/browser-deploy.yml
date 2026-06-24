@@ -115,6 +115,44 @@ jobs:
           echo "preview_tag=$TAG" >> $GITHUB_OUTPUT
           echo "Preview URL: $TAGGED_URL"
 
+  # While this browser PR has a live preview, point the neonbinder_web Convex
+  # *preview default* at it so freshly-created web previews exercise this PR's
+  # browser code instead of the shared dev service. The reset on PR close lives
+  # in preview-cleanup.yml. Single shared pointer: the most recently deployed
+  # browser PR wins; web previews adopt it on their next push.
+  point-convex-previews:
+    needs: deploy-preview
+    if: |
+      github.event_name == 'pull_request'
+      && github.base_ref == 'main'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - id: guard
+        name: Skip if the Convex project key is not configured
+        env:
+          CONVEX_PROJECT_DEPLOY_KEY: ${{ secrets.CONVEX_PROJECT_DEPLOY_KEY }}
+        run: |
+          if [ -z "${CONVEX_PROJECT_DEPLOY_KEY:-}" ]; then
+            echo "::notice::CONVEX_PROJECT_DEPLOY_KEY not set — skipping web preview repoint."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.guard.outputs.skip != 'true'
+        name: Point web Convex preview default at this browser preview
+        uses: ./.github/actions/convex-env-default
+        with:
+          deploy-key: ${{ secrets.CONVEX_PROJECT_DEPLOY_KEY }}
+          op: set
+          type: preview
+          name: NEONBINDER_BROWSER_URL
+          value: ${{ needs.deploy-preview.outputs.preview_url }}
+
   preview-smoke:
     needs: deploy-preview
     if: github.event_name == 'pull_request'

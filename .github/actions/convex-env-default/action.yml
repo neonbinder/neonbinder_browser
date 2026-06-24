@@ -1,0 +1,78 @@
+name: Convex project default env var
+description: >
+  Get/set/remove a project-level DEFAULT environment variable on the
+  neonbinder_web Convex project, authenticated with a project-scoped Convex
+  deploy key (a `project:...|...` key). Used to repoint preview Convex
+  deployments at this repo's per-PR browser-service preview, and to reset that
+  pointer on PR close. A project-scoped key is required because env defaults are
+  a Convex platform-API operation (POST /v1/projects/{id}/update_default_
+  environment_variables) — an ordinary deployment/preview deploy key cannot set
+  them, and a Convex HTTP action cannot reach the platform API at all.
+
+inputs:
+  deploy-key:
+    description: Convex project-scoped deploy key (project:...|...).
+    required: true
+  op:
+    description: set | get | remove
+    required: true
+  name:
+    description: Environment variable name.
+    required: true
+  value:
+    description: Value to set (op=set only).
+    required: false
+    default: ""
+  type:
+    description: Convex deployment type whose defaults are managed.
+    required: false
+    default: preview
+
+outputs:
+  value:
+    description: For op=get, the current default value (empty string if unset).
+    value: ${{ steps.run.outputs.value }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        # The convex CLI reads the deploy key from CONVEX_DEPLOY_KEY; a
+        # project-scoped key routes env-default writes to the platform API for
+        # that project (see cli getBigBrainAuth -> kind "projectKey").
+        CONVEX_DEPLOY_KEY: ${{ inputs.deploy-key }}
+        OP: ${{ inputs.op }}
+        ETYPE: ${{ inputs.type }}
+        ENAME: ${{ inputs.name }}
+        EVALUE: ${{ inputs.value }}
+      run: |
+        set -euo pipefail
+        # `convex env default` requires `convex` in the nearest package.json
+        # (ensureHasConvexDependency). This repo has no convex dependency, so
+        # run from a throwaway project that declares one.
+        work="$(mktemp -d)"
+        cd "$work"
+        printf '%s' '{"name":"convex-cli-runner","private":true,"dependencies":{"convex":"1.39.1"}}' > package.json
+        # --ignore-scripts: the deploy key is in this step's env, so block any
+        # postinstall (convex/transitive) from running and exfiltrating it. The
+        # `env default` subcommand needs no postinstall (no bundling/esbuild).
+        npm install --ignore-scripts --no-audit --no-fund --silent
+        case "$OP" in
+          set)
+            npx convex env default set --type "$ETYPE" "$ENAME" "$EVALUE"
+            ;;
+          remove)
+            npx convex env default remove --type "$ETYPE" "$ENAME"
+            ;;
+          get)
+            # Prints the bare value on success; errors to stderr when unset.
+            v="$(npx convex env default get --type "$ETYPE" "$ENAME" 2>/dev/null || true)"
+            printf 'value=%s\n' "$v" >> "$GITHUB_OUTPUT"
+            ;;
+          *)
+            echo "unknown op: $OP" >&2
+            exit 1
+            ;;
+        esac

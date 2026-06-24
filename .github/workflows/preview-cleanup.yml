@@ -19,6 +19,11 @@ jobs:
       id-token: write
 
     steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
       - uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER_DEV }}
@@ -40,3 +45,53 @@ jobs:
             --region=us-central1 \
             --project=neonbinder-dev \
             --remove-tags="$TAG"
+
+      # If the web Convex preview default still points at THIS PR's browser
+      # preview, reset it to the shared dev browser URL. Compare-and-set so we
+      # don't clobber a different browser PR that repointed it more recently.
+      - id: guard
+        name: Skip reset if the Convex project key is not configured
+        env:
+          CONVEX_PROJECT_DEPLOY_KEY: ${{ secrets.CONVEX_PROJECT_DEPLOY_KEY }}
+        run: |
+          if [ -z "${CONVEX_PROJECT_DEPLOY_KEY:-}" ]; then
+            echo "::notice::CONVEX_PROJECT_DEPLOY_KEY not set — skipping web preview reset."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.guard.outputs.skip != 'true'
+        id: current
+        name: Read current web Convex preview default
+        uses: ./.github/actions/convex-env-default
+        with:
+          deploy-key: ${{ secrets.CONVEX_PROJECT_DEPLOY_KEY }}
+          op: get
+          type: preview
+          name: NEONBINDER_BROWSER_URL
+
+      - if: steps.guard.outputs.skip != 'true'
+        id: decide
+        name: Decide whether the default is this PR's override
+        env:
+          CURRENT: ${{ steps.current.outputs.value }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # Match the tagged-host prefix "//pr-<N>---" so we only reset OUR override.
+          if printf '%s' "$CURRENT" | grep -q "//pr-${PR}---"; then
+            echo "reset=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Preview default is not this PR's override ($CURRENT); leaving as-is."
+          fi
+
+      - if: steps.decide.outputs.reset == 'true'
+        name: Reset web Convex preview default to the shared dev browser URL
+        uses: ./.github/actions/convex-env-default
+        with:
+          deploy-key: ${{ secrets.CONVEX_PROJECT_DEPLOY_KEY }}
+          op: set
+          type: preview
+          name: NEONBINDER_BROWSER_URL
+          # Canonical dev browser-service base URL (hard-coded fallback; update
+          # here if Cloud Run ever migrates the run.app URL).
+          value: https://neonbinder-browser-xxlo66yxuq-uc.a.run.app
