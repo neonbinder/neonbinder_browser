@@ -395,10 +395,14 @@ jobs:
       - id: capture-prev
         name: Capture dev's currently-serving revision
         run: |
+          # NEO-34: select the revision actually serving traffic (percent>0),
+          # not status.traffic[0] — that list includes tag-parked 0%-traffic
+          # entries and resolved to an ancient pre-NEO-20 revision on 2026-05-29.
           PREV=$(gcloud run services describe neonbinder-browser \
             --region=us-central1 \
             --project=neonbinder-dev \
-            --format='value(status.traffic[0].revisionName)')
+            --format=json \
+            | jq -r '[.status.traffic[] | select(.percent > 0)] | max_by(.percent).revisionName // ""')
           echo "Previous dev revision: $PREV"
           echo "prev_revision=$PREV" >> $GITHUB_OUTPUT
 
@@ -666,10 +670,14 @@ jobs:
       - id: capture-prev
         name: Capture prod's currently-serving revision
         run: |
+          # NEO-34: select the revision actually serving traffic (percent>0),
+          # not status.traffic[0] — that list includes tag-parked 0%-traffic
+          # entries and resolved to an ancient pre-NEO-20 revision on 2026-05-29.
           PREV=$(gcloud run services describe neonbinder-browser \
             --region=us-central1 \
             --project=neonbinder \
-            --format='value(status.traffic[0].revisionName)')
+            --format=json \
+            | jq -r '[.status.traffic[] | select(.percent > 0)] | max_by(.percent).revisionName // ""')
           echo "Previous prod revision: $PREV"
           echo "prev_revision=$PREV" >> $GITHUB_OUTPUT
 
