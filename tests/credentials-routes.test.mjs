@@ -11,8 +11,10 @@
  *
  * NEO-20: app-layer auth was removed in favor of Cloud Run IAM, so these
  * tests no longer exercise an Authorization check — Cloud Run runs in front
- * of Express and is out of scope for an in-process test. We rely on the
- * smoke suite (against a real Cloud Run deployment) to verify the IAM gate.
+ * of Express and is out of scope for an in-process test. The IAM gate is
+ * enforced by Cloud Run config (--no-allow-unauthenticated + run.invoker
+ * restricted to the convex SA); the login-probe integration suite exercises
+ * the authenticated path against a real Cloud Run deployment.
  */
 
 import { describe, it, before, after } from "node:test";
