@@ -28,6 +28,14 @@ inputs:
     description: Convex deployment type whose defaults are managed.
     required: false
     default: preview
+  project:
+    description: >
+      Convex project as team-slug:project-slug. Required: a preview deploy key
+      is not bound to one deployment, so without --project the CLI tries to
+      resolve a (possibly GC'd) deployment and 404s. --project resolves the
+      project directly.
+    required: false
+    default: neon-binder:neonbinder
 
 outputs:
   value:
@@ -48,6 +56,7 @@ runs:
         ETYPE: ${{ inputs.type }}
         ENAME: ${{ inputs.name }}
         EVALUE: ${{ inputs.value }}
+        EPROJECT: ${{ inputs.project }}
       run: |
         set -euo pipefail
         # `convex env default` requires `convex` in the nearest package.json
@@ -60,16 +69,18 @@ runs:
         # postinstall (convex/transitive) from running and exfiltrating it. The
         # `env default` subcommand needs no postinstall (no bundling/esbuild).
         npm install --ignore-scripts --no-audit --no-fund --silent
+        # --project resolves the project by slug (preview keys aren't bound to a
+        # single deployment; without it the CLI 404s on deployment resolution).
         case "$OP" in
           set)
-            npx convex env default set --type "$ETYPE" "$ENAME" "$EVALUE"
+            npx convex env default set --project "$EPROJECT" --type "$ETYPE" "$ENAME" "$EVALUE"
             ;;
           remove)
-            npx convex env default remove --type "$ETYPE" "$ENAME"
+            npx convex env default remove --project "$EPROJECT" --type "$ETYPE" "$ENAME"
             ;;
           get)
             # Prints the bare value on success; errors to stderr when unset.
-            v="$(npx convex env default get --type "$ETYPE" "$ENAME" 2>/dev/null || true)"
+            v="$(npx convex env default get --project "$EPROJECT" --type "$ETYPE" "$ENAME" 2>/dev/null || true)"
             printf 'value=%s\n' "$v" >> "$GITHUB_OUTPUT"
             ;;
           *)
