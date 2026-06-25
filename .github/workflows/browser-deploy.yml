@@ -136,10 +136,10 @@ jobs:
       - id: guard
         name: Skip if the Convex project key is not configured
         env:
-          CONVEX_PROJECT_DEPLOY_KEY: ${{ secrets.CONVEX_PROJECT_DEPLOY_KEY }}
+          CONVEX_PREVIEW_DEPLOY_KEY: ${{ secrets.CONVEX_PREVIEW_DEPLOY_KEY }}
         run: |
-          if [ -z "${CONVEX_PROJECT_DEPLOY_KEY:-}" ]; then
-            echo "::notice::CONVEX_PROJECT_DEPLOY_KEY not set — skipping web preview repoint."
+          if [ -z "${CONVEX_PREVIEW_DEPLOY_KEY:-}" ]; then
+            echo "::notice::CONVEX_PREVIEW_DEPLOY_KEY not set — skipping web preview repoint."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -147,7 +147,7 @@ jobs:
         name: Point web Convex preview default at this browser preview
         uses: ./.github/actions/convex-env-default
         with:
-          deploy-key: ${{ secrets.CONVEX_PROJECT_DEPLOY_KEY }}
+          deploy-key: ${{ secrets.CONVEX_PREVIEW_DEPLOY_KEY }}
           op: set
           type: preview
           name: NEONBINDER_BROWSER_URL

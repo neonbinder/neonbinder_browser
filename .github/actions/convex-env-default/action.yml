@@ -1,17 +1,18 @@
 name: Convex project default env var
 description: >
   Get/set/remove a project-level DEFAULT environment variable on the
-  neonbinder_web Convex project, authenticated with a project-scoped Convex
-  deploy key (a `project:...|...` key). Used to repoint preview Convex
-  deployments at this repo's per-PR browser-service preview, and to reset that
-  pointer on PR close. A project-scoped key is required because env defaults are
+  neonbinder_web Convex project, authenticated with a Convex *preview* deploy key
+  (a `preview:<team>:<project>|...` key generated in the project's Preview Deploy
+  Keys settings). Used to repoint preview Convex deployments at this repo's per-PR
+  browser-service preview, and to reset that pointer on PR close. Env defaults are
   a Convex platform-API operation (POST /v1/projects/{id}/update_default_
-  environment_variables) — an ordinary deployment/preview deploy key cannot set
-  them, and a Convex HTTP action cannot reach the platform API at all.
+  environment_variables); a preview deploy key is project-scoped to previews and
+  authorizes it (verified), while staying lower-privilege than a prod/project key
+  (no production access). A Convex HTTP action cannot reach the platform API.
 
 inputs:
   deploy-key:
-    description: Convex project-scoped deploy key (project:...|...).
+    description: Convex preview deploy key (preview:<team>:<project>|...).
     required: true
   op:
     description: set | get | remove
@@ -39,9 +40,9 @@ runs:
     - id: run
       shell: bash
       env:
-        # The convex CLI reads the deploy key from CONVEX_DEPLOY_KEY; a
-        # project-scoped key routes env-default writes to the platform API for
-        # that project (see cli getBigBrainAuth -> kind "projectKey").
+        # The convex CLI reads the deploy key from CONVEX_DEPLOY_KEY; a preview
+        # deploy key authenticates to the platform API for env-default
+        # reads/writes (cli getBigBrainAuth -> kind "previewDeployKey").
         CONVEX_DEPLOY_KEY: ${{ inputs.deploy-key }}
         OP: ${{ inputs.op }}
         ETYPE: ${{ inputs.type }}
